@@ -69,6 +69,12 @@ pub const DECREASE_STAKE_TIMELOCK: u64 = 7 * 24 * 60 * 60;
 /// Withdrawal request timelock delay, in seconds (24 hours).
 pub const WITHDRAWAL_TIMELOCK_DELAY: u64 = 24 * 60 * 60;
 
+/// Penalty applied to partial mid-loan withdrawals, in basis points (1000 = 10%).
+pub const PARTIAL_WITHDRAWAL_PENALTY_BPS: i128 = 1_000;
+
+/// Maximum fraction of stake that can be partially withdrawn during an active loan (50%).
+pub const PARTIAL_WITHDRAWAL_MAX_BPS: i128 = 5_000;
+
 // ── Loan Extension ────────────────────────────────────────────────────────────
 
 /// A pending loan extension request. Created by the borrower; approved by vouchers.
@@ -149,7 +155,10 @@ pub enum DataKey {
     BorrowerCollateral(Address), // borrower → i128 collateral amount deposited
     BorrowerCollateralToken(Address), // borrower → Address token used for collateral
     InsurancePool,           // i128 total funds contributed to the insurance pool
-    InsuranceClaim(u64),     // loan_id → Address of voucher who claimed (prevents double-claim)
+    InsuranceClaim(u64),     // loan_id → bool: has any claim been made (legacy single-claim guard)
+    InsuranceFeeBps,         // u32: protocol fee routed to insurance pool per loan (default 50 = 0.5%)
+    InsuranceCoverageBps,    // u32: max payout as % of slashed stake (default 2500 = 25%)
+    InsuranceVoucherClaim(u64, Address), // (loan_id, voucher) → i128 amount already claimed
     VouchHistory(Address, Address, Address), // (borrower, voucher, token) → Vec<VouchHistoryEntry>
     VouchDelegation(Address, Address, Address), // (borrower, original_voucher, token) → Address (delegate)
     YieldReserve,            // i128 balance of the yield reserve
@@ -167,29 +176,10 @@ pub enum DataKey {
     LoanExtension(Address),
     /// Issue #598: loan_id → Vec<PaymentRecord> (payment history)
     PaymentHistory(u64),
-    /// voucher → VouchingDelegation (global delegate + limits)
-    VouchingDelegation(Address),
-    /// (voucher, delegate) → i128 total stake used by delegate so far
-    DelegateUsedStake(Address, Address),
-}
-
-// ── Vouching Delegation ───────────────────────────────────────────────────────
-
-/// A global vouching delegation: the voucher authorises `delegate` to call
-/// `vouch_as_delegate` on their behalf, subject to per-vouch and total caps.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VouchingDelegation {
-    /// The address authorised to vouch on behalf of the voucher.
-    pub delegate: Address,
-    /// Maximum stake the delegate may commit per individual vouch (stroops).
-    pub max_stake_per_vouch: i128,
-    /// Maximum total stake the delegate may commit across all vouches (stroops).
-    pub max_total_stake: i128,
-    /// Ledger timestamp when this delegation was created.
-    pub created_at: u64,
-    /// Optional expiry timestamp; delegation is void after this time.
-    pub expires_at: Option<u64>,
+    /// Voucher cumulative reputation stats: voucher → VoucherStats
+    VoucherStats(Address),
+    /// Withdrawal queue: borrower → Vec<QueuedWithdrawal>
+    WithdrawalQueue(Address),
 }
 
 // ── Governance ────────────────────────────────────────────────────────────────
@@ -376,6 +366,23 @@ pub struct WithdrawalRequest {
     pub borrower: Address,
     pub token: Address,
     pub requested_at: u64,
+}
+
+/// A queued withdrawal request submitted during an active loan.
+/// Processed automatically when the loan is repaid or slashed.
+#[contracttype]
+#[derive(Clone)]
+pub struct QueuedWithdrawal {
+    /// The voucher requesting withdrawal.
+    pub voucher: Address,
+    /// Token the stake is denominated in.
+    pub token: Address,
+    /// Ledger timestamp when the request was submitted.
+    pub requested_at: u64,
+    /// Whether this is a partial withdrawal (up to 50% of stake with penalty).
+    pub partial: bool,
+    /// Priority fee paid by the voucher (in stroops), distributed to remaining vouchers.
+    pub priority_fee: i128,
 }
 
 #[contracttype]
