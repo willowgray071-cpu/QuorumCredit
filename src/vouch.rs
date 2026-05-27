@@ -5,7 +5,7 @@ use crate::helpers::{
     has_active_loan, require_allowed_token, require_not_paused, require_positive_amount,
 };
 use crate::types::{
-    DataKey, QueuedWithdrawal, VouchHistoryEntry, VouchRecord,
+    BridgeRecord, DataKey, QueuedWithdrawal, VouchHistoryEntry, VouchRecord,
     PARTIAL_WITHDRAWAL_MAX_BPS, PARTIAL_WITHDRAWAL_PENALTY_BPS, BPS_DENOMINATOR,
 };
 use soroban_sdk::{symbol_short, token, Address, Env, Vec};
@@ -50,11 +50,12 @@ pub fn vouch(
     borrower: Address,
     stake: i128,
     token: Address,
+    chain_id: Option<u32>,
 ) -> Result<(), ContractError> {
     voucher.require_auth();
     require_not_paused(&env)?;
     let cfg = VouchConfig::load(&env);
-    do_vouch(&env, &cfg, voucher, borrower, stake, token)
+    do_vouch(&env, &cfg, voucher, borrower, stake, token, chain_id)
 }
 
 fn validate_vouch<'a>(
@@ -64,6 +65,7 @@ fn validate_vouch<'a>(
     borrower: &Address,
     stake: i128,
     token: &Address,
+    chain_id: Option<u32>,
 ) -> Result<(token::Client<'a>, Vec<VouchRecord>), ContractError> {
     require_positive_amount(env, stake)?;
 
@@ -92,6 +94,12 @@ fn validate_vouch<'a>(
     }
 
     let token_client = require_allowed_token(env, token)?;
+
+    // Bridge validation: if chain_id is provided, the token must originate from
+    // a registered, active bridge for that chain.
+    if let Some(cid) = chain_id {
+        validate_bridge(env, cid, token)?;
+    }
 
     if cfg.min_stake > 0 && stake < cfg.min_stake {
         return Err(ContractError::MinStakeNotMet);
@@ -144,6 +152,7 @@ fn commit_vouch(
     stake: i128,
     token: Address,
     mut vouches: Vec<VouchRecord>,
+    chain_id: Option<u32>,
 ) -> Result<(), ContractError> {
     let contract = env.current_contract_address();
 
@@ -178,6 +187,7 @@ fn commit_vouch(
         token: token.clone(),
         expiry_timestamp: None,
         delegate: None,
+        chain_id,
     });
 
     env.storage()
@@ -226,9 +236,10 @@ fn do_vouch(
     borrower: Address,
     stake: i128,
     token: Address,
+    chain_id: Option<u32>,
 ) -> Result<(), ContractError> {
-    let (token_client, vouches) = validate_vouch(env, cfg, &voucher, &borrower, stake, &token)?;
-    commit_vouch(env, &token_client, voucher, borrower, stake, token, vouches)
+    let (token_client, vouches) = validate_vouch(env, cfg, &voucher, &borrower, stake, &token, chain_id)?;
+    commit_vouch(env, &token_client, voucher, borrower, stake, token, vouches, chain_id)
 }
 
 pub fn batch_vouch(
@@ -237,6 +248,7 @@ pub fn batch_vouch(
     borrowers: Vec<Address>,
     stakes: Vec<i128>,
     token: Address,
+    chain_id: Option<u32>,
 ) -> Result<(), ContractError> {
     voucher.require_auth();
     require_not_paused(&env)?;
@@ -251,7 +263,7 @@ pub fn batch_vouch(
     for i in 0..borrowers.len() {
         let borrower = borrowers.get(i).unwrap();
         let stake = stakes.get(i).unwrap();
-        validate_vouch(&env, &cfg, &voucher, &borrower, stake, &token)?;
+        validate_vouch(&env, &cfg, &voucher, &borrower, stake, &token, chain_id)?;
     }
 
     // Phase 2: commit all — only reached if all validations passed
@@ -264,7 +276,7 @@ pub fn batch_vouch(
             .persistent()
             .get(&DataKey::Vouches(borrower.clone()))
             .unwrap_or(Vec::new(&env));
-        commit_vouch(&env, &token_client, voucher.clone(), borrower, stake, token.clone(), vouches)?;
+        commit_vouch(&env, &token_client, voucher.clone(), borrower, stake, token.clone(), vouches, chain_id)?;
     }
 
     Ok(())
@@ -739,4 +751,125 @@ fn distribute_penalty(
             token_client.transfer(&contract, &vr.voucher, &share);
         }
     }
+}
+
+// ── Bridge validation ─────────────────────────────────────────────────────────
+
+/// Validate that `chain_id` is registered, active, and that `token` is the
+/// bridge contract address for that chain.
+fn validate_bridge(env: &Env, chain_id: u32, token: &Address) -> Result<(), ContractError> {
+    let bridges: Vec<BridgeRecord> = env
+        .storage()
+        .instance()
+        .get(&DataKey::AllowedBridges)
+        .unwrap_or(Vec::new(env));
+
+    for bridge in bridges.iter() {
+        if bridge.chain_id == chain_id {
+            if !bridge.active {
+                return Err(ContractError::InvalidChain);
+            }
+            if bridge.bridge_address != *token {
+                return Err(ContractError::InvalidChain);
+            }
+            return Ok(());
+        }
+    }
+
+    Err(ContractError::InvalidChain)
+}
+
+/// Register a new cross-chain bridge. Admin-only.
+pub fn register_bridge(
+    env: Env,
+    admin_signers: Vec<Address>,
+    chain_id: u32,
+    chain_name: soroban_sdk::String,
+    bridge_address: Address,
+) -> Result<(), ContractError> {
+    require_bridge_admin(&env, &admin_signers)?;
+
+    let mut bridges: Vec<BridgeRecord> = env
+        .storage()
+        .instance()
+        .get(&DataKey::AllowedBridges)
+        .unwrap_or(Vec::new(&env));
+
+    for b in bridges.iter() {
+        if b.chain_id == chain_id {
+            return Err(ContractError::BridgeAlreadyRegistered);
+        }
+    }
+
+    bridges.push_back(BridgeRecord {
+        chain_id,
+        chain_name,
+        bridge_address,
+        active: true,
+    });
+
+    env.storage()
+        .instance()
+        .set(&DataKey::AllowedBridges, &bridges);
+
+    Ok(())
+}
+
+/// Deactivate a registered bridge. Admin-only.
+pub fn remove_bridge(
+    env: Env,
+    admin_signers: Vec<Address>,
+    chain_id: u32,
+) -> Result<(), ContractError> {
+    require_bridge_admin(&env, &admin_signers)?;
+
+    let mut bridges: Vec<BridgeRecord> = env
+        .storage()
+        .instance()
+        .get(&DataKey::AllowedBridges)
+        .unwrap_or(Vec::new(&env));
+
+    let idx = bridges
+        .iter()
+        .position(|b| b.chain_id == chain_id)
+        .ok_or(ContractError::InvalidChain)? as u32;
+
+    let mut record = bridges.get(idx).unwrap();
+    record.active = false;
+    bridges.set(idx, record);
+
+    env.storage()
+        .instance()
+        .set(&DataKey::AllowedBridges, &bridges);
+
+    Ok(())
+}
+
+/// Return all registered bridges.
+pub fn get_bridges(env: Env) -> Vec<BridgeRecord> {
+    env.storage()
+        .instance()
+        .get(&DataKey::AllowedBridges)
+        .unwrap_or(Vec::new(&env))
+}
+
+/// Verify that enough admin signers have authorised the call.
+fn require_bridge_admin(env: &Env, signers: &Vec<Address>) -> Result<(), ContractError> {
+    let cfg: crate::types::Config = env
+        .storage()
+        .instance()
+        .get(&DataKey::Config)
+        .expect("not initialized");
+
+    let mut valid: u32 = 0;
+    for signer in signers.iter() {
+        if cfg.admins.iter().any(|a| a == signer) {
+            signer.require_auth();
+            valid += 1;
+        }
+    }
+    if valid < cfg.admin_threshold {
+        return Err(ContractError::UnauthorizedCaller);
+    }
+    Ok(())
 }

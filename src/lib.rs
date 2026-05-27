@@ -10,6 +10,8 @@ use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Str
 
 #[cfg(test)]
 mod withdrawal_queue_test;
+#[cfg(test)]
+mod cross_chain_vouch_test;
 
 use crate::errors::ContractError;
 use crate::helpers::{config, get_active_loan_record, has_active_loan, require_allowed_token, require_not_paused};
@@ -78,8 +80,9 @@ impl QuorumCreditContract {
         borrower: Address,
         stake: i128,
         token: Address,
+        chain_id: Option<u32>,
     ) -> Result<(), ContractError> {
-        vouch::vouch(env, voucher, borrower, stake, token)
+        vouch::vouch(env, voucher, borrower, stake, token, chain_id)
     }
 
     pub fn batch_vouch(
@@ -88,8 +91,9 @@ impl QuorumCreditContract {
         borrowers: Vec<Address>,
         stakes: Vec<i128>,
         token: Address,
+        chain_id: Option<u32>,
     ) -> Result<(), ContractError> {
-        vouch::batch_vouch(env, voucher, borrowers, stakes, token)
+        vouch::batch_vouch(env, voucher, borrowers, stakes, token, chain_id)
     }
 
     // ─────────────────────────────────────────────
@@ -153,6 +157,36 @@ impl QuorumCreditContract {
     /// Get the pending withdrawal queue for a borrower.
     pub fn get_withdrawal_queue(env: Env, borrower: Address) -> Vec<QueuedWithdrawal> {
         vouch::get_withdrawal_queue(env, borrower)
+    }
+
+    // ─────────────────────────────────────────────
+    // Cross-chain Bridge Management
+    // ─────────────────────────────────────────────
+
+    /// Register a cross-chain bridge so vouchers can stake tokens from other chains.
+    /// Requires admin quorum. `chain_id` must be unique (e.g. 1 = Ethereum, 137 = Polygon).
+    pub fn register_bridge(
+        env: Env,
+        admin_signers: Vec<Address>,
+        chain_id: u32,
+        chain_name: String,
+        bridge_address: Address,
+    ) -> Result<(), ContractError> {
+        vouch::register_bridge(env, admin_signers, chain_id, chain_name, bridge_address)
+    }
+
+    /// Deactivate a registered bridge. Existing vouches are unaffected; new ones are rejected.
+    pub fn remove_bridge(
+        env: Env,
+        admin_signers: Vec<Address>,
+        chain_id: u32,
+    ) -> Result<(), ContractError> {
+        vouch::remove_bridge(env, admin_signers, chain_id)
+    }
+
+    /// Return all registered bridges (active and inactive).
+    pub fn get_bridges(env: Env) -> Vec<crate::types::BridgeRecord> {
+        vouch::get_bridges(env)
     }
 
     // ─────────────────────────────────────────────
