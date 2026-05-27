@@ -57,4 +57,14 @@ pub enum ContractError {
     WithdrawalNotQueued = 47,
     /// Partial withdrawal amount exceeds the 50% cap.
     PartialWithdrawalExceedsCap = 48,
+    /// #667: Caller is not the registered oracle.
+    OracleUnauthorized = 49,
+    /// #667: Credit score value is out of the valid range (0–1000).
+    InvalidCreditScore = 50,
+    /// #666: Repayment is pending oracle verification; cannot release yet.
+    EscrowPending = 51,
+    /// #666: No repayment is currently held in escrow for this borrower.
+    NoEscrowFound = 52,
+    /// #669: Maximum retry attempts exceeded.
+    MaxRetriesExceeded = 53,
 }

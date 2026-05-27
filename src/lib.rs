@@ -18,7 +18,7 @@ mod withdrawal_queue_test;
 use crate::errors::ContractError;
 use crate::helpers::{config, get_active_loan_record, has_active_loan, require_allowed_token, require_not_paused};
 use crate::types::{
-    Config, DataKey, LoanRecord, LoanStatus, QueuedWithdrawal, VouchRecord,
+    Config, DataKey, EscrowStatus, LoanRecord, LoanStatus, QueuedWithdrawal, VouchRecord,
     DEFAULT_LIQUIDITY_MINING_RATE_BPS, DEFAULT_LOAN_DURATION, DEFAULT_MAX_LOAN_TO_STAKE_RATIO,
     DEFAULT_MAX_VOUCHERS, DEFAULT_MIN_LOAN_AMOUNT, DEFAULT_MIN_VOUCH_AGE_SECS, DEFAULT_SLASH_BPS,
     DEFAULT_YIELD_BPS,
@@ -68,6 +68,8 @@ impl QuorumCreditContract {
                 min_vouch_age_secs: DEFAULT_MIN_VOUCH_AGE_SECS,
                 prepayment_penalty_bps: 0,
                 liquidity_mining_rate_bps: DEFAULT_LIQUIDITY_MINING_RATE_BPS,
+                oracle_address: None,
+                early_repayment_discount_bps: 0,
             },
         );
 
@@ -233,6 +235,8 @@ impl QuorumCreditContract {
             amortization_schedule: Vec::new(&env),
             reminder_sent: false,
             risk_score: 0,
+            escrow_status: EscrowStatus::None,
+            retry_count: 0,
         };
 
         env.storage()
@@ -262,8 +266,17 @@ impl QuorumCreditContract {
             return Err(ContractError::InvalidAmount);
         }
 
-        let total_owed = loan.amount + loan.total_yield;
-        let outstanding = total_owed - loan.amount_repaid;
+        let cfg = config(&env);
+        let now = env.ledger().timestamp();
+
+        // #668: Apply early repayment discount if repaying before deadline
+        let discount = if now < loan.deadline && cfg.early_repayment_discount_bps > 0 {
+            loan.total_yield * cfg.early_repayment_discount_bps as i128 / 10_000
+        } else {
+            0
+        };
+        let effective_total_owed = loan.amount + loan.total_yield - discount;
+        let outstanding = effective_total_owed - loan.amount_repaid;
 
         if payment > outstanding {
             return Err(ContractError::InvalidAmount);
@@ -274,9 +287,129 @@ impl QuorumCreditContract {
 
         loan.amount_repaid += payment;
 
-        if loan.amount_repaid >= total_owed {
+        if loan.amount_repaid >= effective_total_owed {
+            // #666/#667: If oracle is configured, hold in escrow pending verification.
+            // Otherwise release immediately.
+            if cfg.oracle_address.is_some() {
+                loan.escrow_status = EscrowStatus::Pending;
+                loan.status = LoanStatus::Active; // stays active until oracle releases
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::EscrowAmount(borrower.clone()), &payment);
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Loan(loan.id), &loan);
+                env.events().publish(
+                    (symbol_short!("loan"), symbol_short!("escrow")),
+                    (borrower, payment),
+                );
+            } else {
+                // No oracle — release immediately
+                loan.status = LoanStatus::Repaid;
+                loan.repayment_timestamp = Some(now);
+                loan.escrow_status = EscrowStatus::Released;
+
+                let vouches: Vec<VouchRecord> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Vouches(borrower.clone()))
+                    .unwrap_or(Vec::new(&env));
+
+                let total_stake: i128 = vouches
+                    .iter()
+                    .filter(|v| v.token == loan.token_address)
+                    .map(|v| v.stake)
+                    .sum();
+
+                for v in vouches.iter() {
+                    if v.token != loan.token_address {
+                        continue;
+                    }
+                    let yield_share = if total_stake > 0 {
+                        loan.total_yield * v.stake / total_stake
+                    } else {
+                        0
+                    };
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        &v.voucher,
+                        &(v.stake + yield_share),
+                    );
+                }
+
+                vouch::process_withdrawal_queue(&env, &borrower);
+
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::ActiveLoan(borrower.clone()));
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::Vouches(borrower.clone()));
+
+                env.events().publish(
+                    (symbol_short!("loan"), symbol_short!("repaid")),
+                    (borrower.clone(), loan.amount),
+                );
+
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Loan(loan.id), &loan);
+            }
+        } else {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Loan(loan.id), &loan);
+        }
+
+        Ok(())
+    }
+
+    /// #667: Called by the registered oracle to verify a repayment held in escrow.
+    /// If `approved` is true, releases funds to vouchers. If false, returns funds to borrower.
+    pub fn verify_repayment(
+        env: Env,
+        oracle: Address,
+        borrower: Address,
+        approved: bool,
+    ) -> Result<(), ContractError> {
+        oracle.require_auth();
+        require_not_paused(&env)?;
+
+        // Verify caller is the registered oracle
+        let cfg = config(&env);
+        let registered = cfg.oracle_address.ok_or(ContractError::OracleUnauthorized)?;
+        if oracle != registered {
+            return Err(ContractError::OracleUnauthorized);
+        }
+
+        let loan_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveLoan(borrower.clone()))
+            .ok_or(ContractError::NoActiveLoan)?;
+        let mut loan: LoanRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Loan(loan_id))
+            .ok_or(ContractError::NoActiveLoan)?;
+
+        if loan.escrow_status != EscrowStatus::Pending {
+            return Err(ContractError::NoEscrowFound);
+        }
+
+        let escrowed: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowAmount(borrower.clone()))
+            .unwrap_or(0);
+
+        let token_client = require_allowed_token(&env, &loan.token_address)?;
+        let now = env.ledger().timestamp();
+
+        if approved {
+            loan.escrow_status = EscrowStatus::Released;
             loan.status = LoanStatus::Repaid;
-            loan.repayment_timestamp = Some(env.ledger().timestamp());
+            loan.repayment_timestamp = Some(now);
 
             let vouches: Vec<VouchRecord> = env
                 .storage()
@@ -306,7 +439,6 @@ impl QuorumCreditContract {
                 );
             }
 
-            // Process any queued withdrawals now that the loan is closed
             vouch::process_withdrawal_queue(&env, &borrower);
 
             env.storage()
@@ -320,13 +452,68 @@ impl QuorumCreditContract {
                 (symbol_short!("loan"), symbol_short!("repaid")),
                 (borrower.clone(), loan.amount),
             );
+        } else {
+            // Oracle rejected — return escrowed funds to borrower
+            loan.escrow_status = EscrowStatus::Rejected;
+            loan.amount_repaid -= escrowed;
+
+            if escrowed > 0 {
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &borrower,
+                    &escrowed,
+                );
+            }
+
+            env.events().publish(
+                (symbol_short!("loan"), symbol_short!("escrow_rej")),
+                (borrower.clone(), escrowed),
+            );
         }
 
+        env.storage()
+            .persistent()
+            .remove(&DataKey::EscrowAmount(borrower.clone()));
         env.storage()
             .persistent()
             .set(&DataKey::Loan(loan.id), &loan);
 
         Ok(())
+    }
+
+    /// #669: Retry a failed repayment. Increments retry_count and re-attempts the transfer.
+    /// Returns `MaxRetriesExceeded` if retry_count >= MAX_REPAYMENT_RETRIES.
+    pub fn retry_repayment(
+        env: Env,
+        borrower: Address,
+        payment: i128,
+    ) -> Result<(), ContractError> {
+        borrower.require_auth();
+        require_not_paused(&env)?;
+
+        let loan_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveLoan(borrower.clone()))
+            .ok_or(ContractError::NoActiveLoan)?;
+        let mut loan: LoanRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Loan(loan_id))
+            .ok_or(ContractError::NoActiveLoan)?;
+
+        const MAX_REPAYMENT_RETRIES: u32 = 3;
+        if loan.retry_count >= MAX_REPAYMENT_RETRIES {
+            return Err(ContractError::MaxRetriesExceeded);
+        }
+
+        loan.retry_count += 1;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Loan(loan.id), &loan);
+
+        // Delegate to the standard repay logic
+        Self::repay(env, borrower, payment)
     }
 
     pub fn get_loan(env: Env, borrower: Address) -> Option<LoanRecord> {

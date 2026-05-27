@@ -110,6 +110,23 @@ pub enum LoanStatus {
     Defaulted,
 }
 
+// ── Escrow Status (#666) ──────────────────────────────────────────────────────
+
+/// Tracks the escrow state of a repayment.
+/// Repayments are held in escrow until oracle verification releases them.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EscrowStatus {
+    /// No repayment is currently held in escrow.
+    None,
+    /// A repayment has been received and is pending oracle verification.
+    Pending,
+    /// Oracle has verified the repayment; funds have been released to vouchers.
+    Released,
+    /// Oracle rejected the repayment; funds were returned to the borrower.
+    Rejected,
+}
+
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -188,6 +205,12 @@ pub enum DataKey {
     StakingDerivative(Address, Address),
     // #637: Fraud Detection
     VoucherFraudScore(Address),
+    // #667: Oracle address for repayment verification
+    OracleAddress,
+    // #667: External credit score per borrower
+    ExternalCreditScore(Address),
+    // #666: Escrowed repayment amount per borrower (held pending oracle verification)
+    EscrowAmount(Address),
 }
 
 // ── Governance ────────────────────────────────────────────────────────────────
@@ -241,6 +264,12 @@ pub struct Config {
     pub prepayment_penalty_bps: u32,
     /// #634: Liquidity mining reward rate in basis points per epoch (e.g. 50 = 0.5% per 7 days).
     pub liquidity_mining_rate_bps: u32,
+    /// #667: Optional oracle contract address for repayment verification.
+    /// When set, repayments are held in escrow until the oracle calls `verify_repayment`.
+    pub oracle_address: Option<Address>,
+    /// #668: Discount applied to the total owed when repaying before the deadline,
+    /// in basis points (e.g. 50 = 0.5%). 0 means no discount.
+    pub early_repayment_discount_bps: u32,
 }
 
 // ── Data Types ────────────────────────────────────────────────────────────────
@@ -285,6 +314,11 @@ pub struct LoanRecord {
     pub reminder_sent: bool,
     /// Risk score for the borrower (0-100), used for dynamic yield calculation.
     pub risk_score: u32,
+    /// #666: Current escrow state of the repayment.
+    /// Repayments are held in escrow (Pending) until oracle verification.
+    pub escrow_status: EscrowStatus,
+    /// #669: Number of times a failed repayment has been retried.
+    pub retry_count: u32,
 }
 
 /// A single payment event recorded against a loan.
@@ -531,3 +565,17 @@ pub const FRAUD_SCORE_HIGH_THRESHOLD: u32 = 70;
 pub const FRAUD_SCORE_MAX: u32 = 100;
 pub const FRAUD_SCORE_DEFAULT_WEIGHT: u32 = 20;
 pub const FRAUD_SCORE_CONCENTRATION_WEIGHT: u32 = 10;
+
+// ── #667: External Credit Score ───────────────────────────────────────────────
+
+/// Credit score record pushed by a trusted oracle.
+#[contracttype]
+#[derive(Clone)]
+pub struct ExternalCreditScore {
+    /// Score in range 0–1000.
+    pub score: u32,
+    /// Ledger timestamp when this score was last updated.
+    pub updated_at: u64,
+    /// Oracle address that submitted this score.
+    pub oracle: Address,
+}
