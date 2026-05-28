@@ -1,13 +1,17 @@
 use crate::{
     admin,
     errors::ContractError,
+    fraud_detection,
     governance,
     helpers::{self, require_valid_token, validate_admin_config},
     insurance,
+    liquidity_mining,
     loan,
     reputation::ReputationNftExternalClient,
+    staking_derivatives,
     types::*,
     vouch,
+    vouch_snapshot,
 };
 use soroban_sdk::{
     contract, contractimpl, panic_with_error, symbol_short, Address, BytesN, Env, Vec,
@@ -59,6 +63,10 @@ impl QuorumCreditContract {
                 grace_period: 0,
                 min_vouch_age_secs: DEFAULT_MIN_VOUCH_AGE_SECS,
                 prepayment_penalty_bps: 0,
+                liquidity_mining_rate_bps: DEFAULT_LIQUIDITY_MINING_RATE_BPS,
+                recovery_percentage: 0,
+                redistribution_rule: RedistributionRule::Treasury,
+                immunity_period_seconds: 0,
             },
         );
 
@@ -678,6 +686,32 @@ impl QuorumCreditContract {
         slash_bps: Option<i128>,
     ) {
         admin::update_config(env, admin_signers, yield_bps, slash_bps)
+    }
+
+    /// Toggle dynamic slash threshold on/off.
+    /// When enabled, slash penalties adjust based on protocol health.
+    ///
+    /// # Arguments
+    /// * `admin_signers` - Vector of admin addresses (must meet threshold)
+    /// * `enabled` - Whether to enable dynamic slash threshold
+    ///
+    /// # Panics
+    /// * If admin approval is insufficient
+    pub fn set_dynamic_slash_threshold(
+        env: Env,
+        admin_signers: Vec<Address>,
+        enabled: bool,
+    ) {
+        admin::set_dynamic_slash_threshold(env, admin_signers, enabled)
+    }
+
+    /// Get the current effective slash threshold (either static or dynamic).
+    /// This function can be called by anyone to see what slash rate would be applied.
+    ///
+    /// # Returns
+    /// * Current effective slash threshold in basis points
+    pub fn get_effective_slash_threshold(env: Env) -> i128 {
+        admin::get_effective_slash_threshold(env)
     }
 
     /// Set the reputation NFT contract address.
@@ -1412,8 +1446,22 @@ impl QuorumCreditContract {
     }
 
     /// Get slash audit record for a borrower (Issue #536).
-    pub fn get_slash_audit(env: Env, borrower: Address) -> Option<crate::types::SlashAuditRecord> {
-        loan::get_slash_audit(env, borrower)
+    pub fn get_slash_record(env: Env, slash_id: u64) -> Option<crate::types::SlashRecord> {
+        governance::get_slash_record(env, slash_id)
+    }
+
+    pub fn get_slash_audit(env: Env, borrower: Address) -> Option<crate::types::SlashRecord> {
+        governance::get_slash_record_for_borrower(env, borrower)
+    }
+
+    /// Admin-only: reverse a slash and restore slashed funds to the borrower.
+    pub fn reverse_slash(
+        env: Env,
+        admin_signers: Vec<Address>,
+        slash_id: u64,
+        reason: soroban_sdk::String,
+    ) -> Result<(), ContractError> {
+        governance::reverse_slash(env, admin_signers, slash_id, reason)
     }
 
     /// Repay loan with partial payment support (Issue #538).
@@ -1474,6 +1522,42 @@ impl QuorumCreditContract {
 
     // ── Issue #601: Loan Extension / Refinancing ──────────────────────────────
 
+    /// Defer the next payment, extending the loan deadline by one deferment period.
+    /// Limited to `MAX_DEFERMENT_PERIODS` (3) per loan.
+    pub fn defer_payment(env: Env, borrower: Address) -> Result<(), ContractError> {
+        loan::defer_payment(env, borrower)
+    }
+
+    /// Check if a borrower's active loan should be accelerated based on their default count
+    /// against `Config.acceleration_triggers`. Sets deadline to now if triggered.
+    /// Returns `LoanAccelerated` if a trigger condition is met.
+    pub fn check_acceleration(env: Env, borrower: Address) -> Result<(), ContractError> {
+        loan::check_acceleration(env, borrower)
+    }
+
+    /// Set a custom maturity date for an active loan. Admin-only.
+    /// Overrides the default deadline computed from loan_duration.
+    pub fn set_maturity_date(
+        env: Env,
+        admin_signers: Vec<Address>,
+        borrower: Address,
+        maturity_date: u64,
+    ) -> Result<(), ContractError> {
+        loan::set_maturity_date(env, admin_signers, borrower, maturity_date)
+    }
+
+    /// Set the interest rate type and optional index reference for an active loan. Admin-only.
+    /// Use `RateType::Variable` with a non-None `index_reference` for variable-rate loans.
+    pub fn set_loan_rate(
+        env: Env,
+        admin_signers: Vec<Address>,
+        borrower: Address,
+        rate_type: RateType,
+        index_reference: Option<soroban_sdk::String>,
+    ) -> Result<(), ContractError> {
+        loan::set_loan_rate(env, admin_signers, borrower, rate_type, index_reference)
+    }
+
     /// Request a loan extension. Requires voucher approval.
     ///
     /// The borrower requests an extension of their active loan deadline. Vouchers must
@@ -1532,5 +1616,63 @@ impl QuorumCreditContract {
         borrower: Address,
     ) -> Option<crate::types::LoanExtensionRequest> {
         loan::get_extension_request(env, borrower)
+    }
+
+    // ── #634: Liquidity Mining ────────────────────────────────────────────────
+
+    pub fn claim_liquidity_mining_reward(env: Env, voucher: Address) -> Result<i128, ContractError> {
+        liquidity_mining::claim_liquidity_mining_reward(env, voucher)
+    }
+
+    pub fn get_pending_mining_reward(env: Env, voucher: Address) -> i128 {
+        liquidity_mining::get_pending_mining_reward(env, voucher)
+    }
+
+    // ── #635: Vouch Snapshot for Governance ──────────────────────────────────
+
+    pub fn take_vouch_snapshot(env: Env, caller: Address) -> Result<u32, ContractError> {
+        vouch_snapshot::take_vouch_snapshot(env, caller)
+    }
+
+    pub fn get_vouch_snapshot(env: Env, ledger_sequence: u32) -> Option<VouchSnapshotRecord> {
+        vouch_snapshot::get_vouch_snapshot(env, ledger_sequence)
+    }
+
+    pub fn get_snapshot_stake(env: Env, ledger_sequence: u32, borrower: Address) -> i128 {
+        vouch_snapshot::get_snapshot_stake(env, ledger_sequence, borrower)
+    }
+
+    // ── #636: Staking Derivatives ─────────────────────────────────────────────
+
+    pub fn mint_staking_derivative(env: Env, voucher: Address, borrower: Address) -> Result<(), ContractError> {
+        staking_derivatives::mint_staking_derivative(env, voucher, borrower)
+    }
+
+    pub fn transfer_staking_derivative(
+        env: Env,
+        from: Address,
+        to: Address,
+        original_voucher: Address,
+        borrower: Address,
+    ) -> Result<(), ContractError> {
+        staking_derivatives::transfer_staking_derivative(env, from, to, original_voucher, borrower)
+    }
+
+    pub fn get_staking_derivative(env: Env, voucher: Address, borrower: Address) -> Option<StakingDerivativeRecord> {
+        staking_derivatives::get_staking_derivative(env, voucher, borrower)
+    }
+
+    // ── #637: Fraud Detection ─────────────────────────────────────────────────
+
+    pub fn calculate_fraud_score(env: Env, voucher: Address) -> u32 {
+        fraud_detection::calculate_fraud_score(env, voucher)
+    }
+
+    pub fn get_fraud_score(env: Env, voucher: Address) -> u32 {
+        fraud_detection::get_fraud_score(env, voucher)
+    }
+
+    pub fn is_high_fraud_risk(env: Env, voucher: Address) -> bool {
+        fraud_detection::is_high_fraud_risk(env, voucher)
     }
 }

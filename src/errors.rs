@@ -38,34 +38,34 @@ pub enum ContractError {
     SlashAlreadyExecuted = 33,
     LoanBelowMinAmount = 34,
     QuorumNotMet = 35,
-    MaxVouchersPerBorrowerExceeded = 36,
-    InsufficientVoucherBalance = 37,
-    SelfVouchNotAllowed = 38,
-    DuplicateToken = 39,
-    InvalidAdminThreshold = 40,
-    InsufficientYieldReserve = 41,
-    ReminderAlreadySent = 42,
+    DelayNotElapsed = 36,
+    MaxVouchersPerBorrowerExceeded = 37,
+    InsufficientVoucherBalance = 38,
+    SelfVouchNotAllowed = 39,
+    DuplicateToken = 40,
+    InvalidAdminThreshold = 41,
+    InsufficientYieldReserve = 42,
+    ReminderAlreadySent = 43,
     /// Insurance pool has no funds to cover the claim.
-    InsurancePoolEmpty = 43,
+    InsurancePoolEmpty = 44,
     /// Insurance claim already made for this loan.
-    InsuranceClaimAlreadyMade = 44,
+    InsuranceClaimAlreadyMade = 45,
     /// Basis points value is invalid (must be 0–10000).
-    InvalidBps = 45,
+    InvalidBps = 46,
     /// Withdrawal request already queued for this voucher/borrower pair.
     WithdrawalAlreadyQueued = 46,
     /// No queued withdrawal found for this voucher/borrower pair.
     WithdrawalNotQueued = 47,
     /// Partial withdrawal amount exceeds the 50% cap.
     PartialWithdrawalExceedsCap = 48,
-    // #642: Collateral Diversification
-    /// A single sector contributes more than 50% of total vouched stake.
-    SectorConcentrationTooHigh = 49,
-    // #643: Loan Purpose Validation
-    /// The loan_purpose is not in the admin-configured allowed_purposes whitelist.
-    LoanPurposeNotAllowed = 50,
-    // #645: Loan Restructuring
-    /// No pending restructure request found for this borrower.
-    RestructureRequestNotFound = 51,
-    /// A restructure request is already pending for this borrower.
-    RestructureAlreadyPending = 52,
+    /// Borrower was slashed too recently; slash cooldown is still active.
+    SlashCooldownActive = 49,
+    /// Caller is not an admin or protocol-token holder allowed to govern.
+    NotGovernanceParticipant = 50,
+    /// Governance action is not allowed after the voting period has ended.
+    VotingPeriodEnded = 51,
+    /// Governance proposal was not found.
+    ProposalNotFound = 52,
+    /// Governance proposal was already finalized.
+    ProposalAlreadyFinalized = 53,
 }
