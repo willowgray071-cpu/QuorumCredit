@@ -100,6 +100,10 @@ mod regression_tests;
 mod syndication_test;
 #[cfg(test)]
 mod default_prediction_test;
+#[cfg(test)]
+mod admin_delegation_test;
+#[cfg(test)]
+mod governance_veto_test;
 
 pub use errors::ContractError;
 pub use types::*;
@@ -145,6 +149,7 @@ impl QuorumCreditContract {
                 max_loan_to_stake_ratio: DEFAULT_MAX_LOAN_TO_STAKE_RATIO,
                 grace_period: 0,
                 liquidity_mining_rate_bps: DEFAULT_LIQUIDITY_MINING_RATE_BPS,
+                veto_admin: None,
             },
         );
 
@@ -394,6 +399,27 @@ impl QuorumCreditContract {
 
     pub fn disable_borrower_whitelist(env: Env, admin_signers: Vec<Address>) {
         admin::disable_borrower_whitelist(env, admin_signers)
+    }
+
+    pub fn delegate_permission(
+        env: Env,
+        admin_signers: Vec<Address>,
+        delegatee: Address,
+        permissions: Vec<soroban_sdk::String>,
+    ) {
+        admin::delegate_permission(env, admin_signers, delegatee, permissions)
+    }
+
+    pub fn revoke_delegation(env: Env, admin_signers: Vec<Address>, delegatee: Address) {
+        admin::revoke_delegation(env, admin_signers, delegatee)
+    }
+
+    pub fn whitelist_voucher_delegated(env: Env, caller: Address, voucher: Address) {
+        admin::whitelist_voucher_delegated(env, caller, voucher)
+    }
+
+    pub fn set_veto_admin(env: Env, admin_signers: Vec<Address>, veto_admin: Option<Address>) {
+        admin::set_veto_admin(env, admin_signers, veto_admin)
     }
 
     pub fn set_fee_treasury(env: Env, admin_signers: Vec<Address>, treasury: Address) {
@@ -839,6 +865,10 @@ impl QuorumCreditContract {
 
     pub fn execute_governance_change(env: Env, proposal_id: u64) -> Result<(), ContractError> {
         governance::execute_governance_change(env, proposal_id)
+    }
+
+    pub fn veto_proposal(env: Env, proposal_id: u64) -> Result<(), ContractError> {
+        governance::veto_proposal(env, proposal_id)
     }
 
     pub fn get_governance_proposal(

@@ -191,6 +191,12 @@ pub struct AdminAuditEntry {
     pub timestamp: u64,
 }
 
+#[contracttype]
+#[derive(Clone)]
+pub struct AdminDelegationRecord {
+    pub permissions: Vec<soroban_sdk::String>,
+}
+
 // ── Governance ────────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -213,6 +219,8 @@ pub struct GovernanceProposal {
     pub voters: Vec<Address>,
     pub voting_end: u64,
     pub executed: bool,
+    /// #685: Proposal veto status.
+    pub vetoed: bool,
 }
 
 #[contracttype]
@@ -254,6 +262,8 @@ pub struct Config {
     /// #634: Liquidity mining reward rate in basis points (e.g. 100 = 1% per epoch).
     /// Vouchers earn this rate on their staked amount per mining epoch.
     pub liquidity_mining_rate_bps: u32,
+    /// #685: Veto admin address; can veto governance proposals before execution.
+    pub veto_admin: Option<Address>,
 }
 
 // ── Per-Token Config ──────────────────────────────────────────────────────────
