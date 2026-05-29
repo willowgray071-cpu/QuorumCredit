@@ -22,6 +22,8 @@ mod loan_purpose_test;
 mod multi_asset_test;
 #[cfg(test)]
 mod referral_test;
+#[cfg(test)]
+mod stress_test;
 
 pub use errors::ContractError;
 pub use types::*;
