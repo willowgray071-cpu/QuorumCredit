@@ -33,6 +33,16 @@ pub fn require_not_paused(env: &Env) -> Result<(), ContractError> {
 /// Returns `Err(InsufficientFunds)` if `amount` is not strictly positive (≤ 0).
 /// Use this for all numeric inputs that must be > 0 (stakes, loan amounts, thresholds).
 /// All such amounts are denominated in stroops (1 XLM = 10,000,000 stroops).
+///
+/// # Examples
+///
+/// ```ignore
+/// // Positive amount passes
+/// assert!(require_positive_amount(&env, 1).is_ok());
+/// // Zero or negative fails
+/// assert!(require_positive_amount(&env, 0).is_err());
+/// assert!(require_positive_amount(&env, -1).is_err());
+/// ```
 pub fn require_positive_amount(_env: &Env, amount: i128) -> Result<(), ContractError> {
     if amount <= 0 {
         return Err(ContractError::InsufficientFunds);
@@ -195,9 +205,15 @@ pub fn validate_admin_config(
 /// The result is also in stroops.
 ///
 /// # Examples
+///
 /// ```
+/// # fn bps_of(amount: i128, bps: u32) -> i128 { amount * bps as i128 / 10_000 }
 /// // 2% of 1 XLM (10_000_000 stroops) = 200_000 stroops
 /// assert_eq!(bps_of(10_000_000, 200), 200_000);
+/// // 50% slash of 1_000_000 stroops = 500_000 stroops
+/// assert_eq!(bps_of(1_000_000, 5000), 500_000);
+/// // Stake below minimum yield threshold truncates to zero
+/// assert_eq!(bps_of(49, 200), 0);
 /// ```
 pub fn bps_of(amount: i128, bps: u32) -> i128 {
     amount * bps as i128 / BPS_DENOMINATOR
