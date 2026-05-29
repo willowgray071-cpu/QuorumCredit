@@ -61,6 +61,9 @@ impl QuorumCreditContract {
             },
         );
 
+        // Initialize API version (Issue #723)
+        crate::versioning::initialize_api_version(&env);
+
         env.events().publish(
             (symbol_short!("contract"), symbol_short!("init")),
             (deployer, admins, admin_threshold, token),
@@ -1302,5 +1305,155 @@ impl QuorumCreditContract {
         token: Address,
     ) -> Result<(), ContractError> {
         loan::repay_partial(env, borrower, payment, token)
+    }
+
+    // ── API Versioning (Issue #723) ───────────────────────────────────────────
+
+    /// Get the current API version of the contract.
+    ///
+    /// Returns the semantic version (major.minor.patch) of the contract's API.
+    /// Clients can use this to determine compatibility and handle version-specific behavior.
+    pub fn get_api_version(env: Env) -> ApiVersion {
+        crate::versioning::get_api_version(&env)
+    }
+
+    /// Check if the contract supports a specific API version.
+    ///
+    /// # Arguments
+    /// * `major` - Major version number
+    /// * `minor` - Minor version number
+    /// * `patch` - Patch version number
+    ///
+    /// Returns true if the requested version is compatible with the current version.
+    pub fn is_version_compatible(env: Env, major: u32, minor: u32, patch: u32) -> bool {
+        let current = crate::versioning::get_api_version(&env);
+        crate::versioning::is_version_compatible(
+            (major, minor, patch),
+            (current.major, current.minor, current.patch),
+        )
+    }
+
+    // ── API Caching (Issue #724) ──────────────────────────────────────────────
+
+    /// Get a loan record with caching support.
+    ///
+    /// This function returns a cached loan record if available and valid,
+    /// otherwise fetches from storage and caches the result.
+    pub fn get_loan_cached(env: Env, borrower: Address) -> Option<LoanRecord> {
+        if let Some(loan_id) = env
+            .storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::ActiveLoan(borrower.clone()))
+        {
+            // Try to get from cache first
+            if let Some(cached) = crate::cache::get_cached_loan(&env, loan_id) {
+                return Some(cached);
+            }
+
+            // Fall back to storage
+            if let Some(loan) = env
+                .storage()
+                .instance()
+                .get::<DataKey, LoanRecord>(&DataKey::Loan(loan_id))
+            {
+                crate::cache::set_cached_loan(&env, loan_id, loan.clone());
+                return Some(loan);
+            }
+        }
+        None
+    }
+
+    /// Get vouches for a borrower with caching support.
+    ///
+    /// This function returns cached vouches if available and valid,
+    /// otherwise fetches from storage and caches the result.
+    pub fn get_vouches_cached(env: Env, borrower: Address) -> Option<Vec<VouchRecord>> {
+        // Try to get from cache first
+        if let Some(cached) = crate::cache::get_cached_vouches(&env, &borrower) {
+            return Some(cached);
+        }
+
+        // Fall back to storage
+        if let Some(vouches) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Vec<VouchRecord>>(&DataKey::Vouches(borrower.clone()))
+        {
+            crate::cache::set_cached_vouches(&env, &borrower, vouches.clone());
+            return Some(vouches);
+        }
+        None
+    }
+
+    /// Get config with caching support.
+    ///
+    /// This function returns cached config if available and valid,
+    /// otherwise fetches from storage and caches the result.
+    pub fn get_config_cached(env: Env) -> Option<Config> {
+        // Try to get from cache first
+        if let Some(cached) = crate::cache::get_cached_config(&env) {
+            return Some(cached);
+        }
+
+        // Fall back to storage
+        if let Some(config) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Config>(&DataKey::Config)
+        {
+            crate::cache::set_cached_config(&env, config.clone());
+            return Some(config);
+        }
+        None
+    }
+
+    /// Clear all caches (admin only).
+    ///
+    /// This function invalidates all cached records. Useful after configuration changes.
+    pub fn clear_all_caches(env: Env, admin_signers: Vec<Address>) -> Result<(), ContractError> {
+        admin::require_admin_auth(&env, &admin_signers)?;
+        crate::cache::invalidate_config_cache(&env);
+        Ok(())
+    }
+
+    // ── Error Standardization (Issue #725) ────────────────────────────────────
+
+    /// Get a standardized error response for a given error code.
+    ///
+    /// This function returns a structured error response that includes:
+    /// - Numeric error code
+    /// - Human-readable message
+    /// - Optional additional details
+    /// - Timestamp of when the error occurred
+    pub fn get_error_response(env: Env, error_code: u32) -> Option<ErrorResponse> {
+        // Map error codes to ContractError variants
+        let error = match error_code {
+            1 => ContractError::InsufficientFunds,
+            2 => ContractError::ActiveLoanExists,
+            3 => ContractError::StakeOverflow,
+            4 => ContractError::ZeroAddress,
+            5 => ContractError::DuplicateVouch,
+            6 => ContractError::NoActiveLoan,
+            7 => ContractError::ContractPaused,
+            8 => ContractError::LoanPastDeadline,
+            13 => ContractError::MinStakeNotMet,
+            14 => ContractError::LoanExceedsMaxAmount,
+            15 => ContractError::InsufficientVouchers,
+            16 => ContractError::UnauthorizedCaller,
+            17 => ContractError::InvalidAmount,
+            18 => ContractError::InvalidStateTransition,
+            19 => ContractError::AlreadyInitialized,
+            20 => ContractError::VouchTooRecent,
+            24 => ContractError::Blacklisted,
+            30 => ContractError::InvalidToken,
+            31 => ContractError::AlreadyVoted,
+            32 => ContractError::SlashVoteNotFound,
+            33 => ContractError::SlashAlreadyExecuted,
+            34 => ContractError::LoanBelowMinAmount,
+            35 => ContractError::QuorumNotMet,
+            _ => return None,
+        };
+
+        Some(crate::error_response::error_to_response(&env, error))
     }
 }

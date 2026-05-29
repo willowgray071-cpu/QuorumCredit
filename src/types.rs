@@ -112,6 +112,10 @@ pub enum DataKey {
     InsuranceClaim(u64),     // loan_id → Address of voucher who claimed (prevents double-claim)
     VouchHistory(Address, Address, Address), // (borrower, voucher, token) → Vec<VouchHistoryEntry>
     VouchDelegation(Address, Address, Address), // (borrower, original_voucher, token) → Address (delegate)
+    ApiVersion,              // ApiVersion: contract API version (Issue #723)
+    LoanCache(u64),          // loan_id → CachedLoanRecord (Issue #724)
+    VouchesCache(Address),   // borrower → CachedVouchesRecord (Issue #724)
+    ConfigCache,             // CachedConfigRecord (Issue #724)
 }
 
 // ── Governance ────────────────────────────────────────────────────────────────
@@ -279,4 +283,65 @@ pub struct WithdrawalRequest {
     pub borrower: Address,
     pub token: Address,
     pub requested_at: u64,
+}
+
+// ── API Versioning (Issue #723) ───────────────────────────────────────────────
+
+/// Current API version of the contract.
+pub const API_VERSION: u32 = 1;
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ApiVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+}
+
+// ── API Caching (Issue #724) ──────────────────────────────────────────────────
+
+/// Cache TTL in seconds for read-heavy queries (default 60 seconds).
+pub const CACHE_TTL_SECS: u64 = 60;
+
+#[contracttype]
+pub enum CacheKey {
+    LoanCache(u64),           // loan_id → CachedLoanRecord
+    VouchesCache(Address),    // borrower → CachedVouchesRecord
+    ConfigCache,              // CachedConfigRecord
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct CachedLoanRecord {
+    pub data: LoanRecord,
+    pub cached_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct CachedVouchesRecord {
+    pub data: Vec<VouchRecord>,
+    pub cached_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct CachedConfigRecord {
+    pub data: Config,
+    pub cached_at: u64,
+}
+
+// ── Error Standardization (Issue #725) ────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ErrorResponse {
+    /// Numeric error code matching ContractError enum.
+    pub code: u32,
+    /// Human-readable error message.
+    pub message: soroban_sdk::String,
+    /// Optional additional context or details.
+    pub details: Option<soroban_sdk::String>,
+    /// Timestamp when the error occurred.
+    pub timestamp: u64,
 }

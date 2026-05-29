@@ -12,6 +12,9 @@ pub mod reputation;
 mod tests;
 pub mod types;
 pub mod vouch;
+pub mod cache;
+pub mod error_response;
+pub mod versioning;
 
 pub use contract::QuorumCreditContract;
 pub use errors::ContractError;
