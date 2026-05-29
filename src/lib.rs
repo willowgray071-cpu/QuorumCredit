@@ -1,18 +1,20 @@
 #![no_std]
 
-mod admin;
-mod commitment_validator;
-mod errors;
-mod governance;
-mod helpers;
-mod key_manager;
-mod secure_delete;
-mod secure_random;
-mod types;
-mod vouch;
-mod vouch_snapshot;
-
-use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, String, Vec};
+pub mod admin;
+mod contract;
+pub mod errors;
+pub mod governance;
+pub mod helpers;
+pub mod insurance;
+pub mod loan;
+pub mod reputation;
+#[cfg(test)]
+mod tests;
+pub mod types;
+pub mod vouch;
+pub mod cache;
+pub mod error_response;
+pub mod versioning;
 
 pub use errors::ContractError;
 pub use types::*;
