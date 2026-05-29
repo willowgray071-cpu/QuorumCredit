@@ -128,6 +128,18 @@ impl QuorumCreditContract {
         vouch::is_bridge_validated(env, voucher, chain_id)
     }
 
+    /// #642: Vouch with an explicit sector label for diversification enforcement.
+    pub fn vouch_with_sector(
+        env: Env,
+        voucher: Address,
+        borrower: Address,
+        stake: i128,
+        token: Address,
+        sector: String,
+    ) -> Result<(), ContractError> {
+        vouch::vouch_with_sector(env, voucher, borrower, stake, token, sector)
+    }
+
     pub fn batch_vouch(
         env: Env,
         voucher: Address,
@@ -248,6 +260,44 @@ impl QuorumCreditContract {
             return Err(ContractError::InsufficientFunds);
         }
 
+        // #643: Validate loan_purpose against allowed_purposes whitelist (empty = all allowed)
+        if !cfg.allowed_purposes.is_empty() {
+            let purpose_allowed = cfg.allowed_purposes.iter().any(|p| p == loan_purpose);
+            if !purpose_allowed {
+                return Err(ContractError::LoanPurposeNotAllowed);
+            }
+        }
+
+        // #642: Enforce sector diversification — no single sector may contribute > 50% of total stake
+        if total_stake > 0 {
+            let mut sector_names: Vec<soroban_sdk::String> = Vec::new(&env);
+            let mut sector_amounts: Vec<i128> = Vec::new(&env);
+            for v in vouches.iter() {
+                if v.token != token_addr {
+                    continue;
+                }
+                let mut found = false;
+                for i in 0..sector_names.len() {
+                    if sector_names.get(i).unwrap() == v.sector {
+                        let cur = sector_amounts.get(i).unwrap();
+                        sector_amounts.set(i, cur + v.stake);
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    sector_names.push_back(v.sector.clone());
+                    sector_amounts.push_back(v.stake);
+                }
+            }
+            for i in 0..sector_amounts.len() {
+                let s_stake = sector_amounts.get(i).unwrap();
+                if s_stake * 2 > total_stake {
+                    return Err(ContractError::SectorConcentrationTooHigh);
+                }
+            }
+        }
+
         let now = env.ledger().timestamp();
         let loan_id = helpers::next_loan_id(&env);
         let total_yield = amount * cfg.yield_bps / 10_000;
@@ -286,6 +336,22 @@ impl QuorumCreditContract {
         env.storage()
             .persistent()
             .set(&DataKey::LatestLoan(borrower.clone()), &loan_id);
+
+        // #644: Collect insurance premium from borrower if configured
+        if cfg.insurance_premium_bps > 0 {
+            let premium = amount * cfg.insurance_premium_bps / 10_000;
+            if premium > 0 {
+                token_client.transfer(&borrower, &env.current_contract_address(), &premium);
+                let pool_balance: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::InsurancePool)
+                    .unwrap_or(0);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::InsurancePool, &(pool_balance + premium));
+            }
+        }
 
         token_client.transfer(&env.current_contract_address(), &borrower, &amount);
 

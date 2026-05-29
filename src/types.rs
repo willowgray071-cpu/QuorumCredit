@@ -450,6 +450,21 @@ pub struct LoanRecord {
     pub retry_count: u32,
 }
 
+/// #645: Pending loan restructure request — borrower requests, vouchers approve.
+#[contracttype]
+#[derive(Clone)]
+pub struct RestructureRequest {
+    pub borrower: Address,
+    /// New deadline (must be after current deadline).
+    pub new_deadline: u64,
+    /// Reduced outstanding amount (0 = no change to amount).
+    pub new_amount: i128,
+    /// Ledger timestamp when the request was created.
+    pub requested_at: u64,
+    /// Voucher addresses that have approved this request.
+    pub approvals: Vec<Address>,
+}
+
 /// A single payment event recorded against a loan.
 #[contracttype]
 #[derive(Clone)]
