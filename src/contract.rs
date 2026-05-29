@@ -718,6 +718,42 @@ impl QuorumCreditContract {
         admin::get_effective_slash_threshold(env)
     }
 
+    /// Toggle loan-size-based slash scaling on/off.
+    /// When enabled, slash percentage scales linearly with loan size relative to
+    /// total staked collateral. Small loans use `slash_bps`; large loans scale up
+    /// to `loan_size_slash_max_bps`.
+    ///
+    /// # Arguments
+    /// * `admin_signers` - Vector of admin addresses (must meet threshold)
+    /// * `enabled` - Whether to enable loan-size-based slash scaling
+    ///
+    /// # Panics
+    /// * If admin approval is insufficient
+    pub fn set_loan_size_slash_enabled(
+        env: Env,
+        admin_signers: Vec<Address>,
+        enabled: bool,
+    ) {
+        admin::set_loan_size_slash_enabled(env, admin_signers, enabled)
+    }
+
+    /// Set the maximum slash rate for the largest loans when loan-size scaling is enabled.
+    ///
+    /// # Arguments
+    /// * `admin_signers` - Vector of admin addresses (must meet threshold)
+    /// * `max_bps` - Maximum slash rate in basis points (must be >= slash_bps, <= 10_000)
+    ///
+    /// # Panics
+    /// * If admin approval is insufficient
+    /// * If max_bps < slash_bps or max_bps > 10_000
+    pub fn set_loan_size_slash_max_bps(
+        env: Env,
+        admin_signers: Vec<Address>,
+        max_bps: i128,
+    ) {
+        admin::set_loan_size_slash_max_bps(env, admin_signers, max_bps)
+    }
+
     /// Set the reputation NFT contract address.
     ///
     /// # Arguments

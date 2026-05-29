@@ -78,6 +78,14 @@ pub const DEFAULT_LIQUIDITY_MINING_RATE_BPS: u32 = 50;
 /// Default dynamic slash threshold setting (false = disabled by default).
 pub const DEFAULT_DYNAMIC_SLASH_THRESHOLD: bool = false;
 
+/// Default loan-size-based slash scaling setting (false = disabled by default).
+pub const DEFAULT_LOAN_SIZE_SLASH_ENABLED: bool = false;
+
+/// Default maximum slash rate for the largest loans, in basis points (8000 = 80%).
+/// When loan-size scaling is enabled, slash_bps is the floor (small loans) and
+/// this is the ceiling (loans at or above the total staked collateral).
+pub const DEFAULT_LOAN_SIZE_SLASH_MAX_BPS: i128 = 8_000;
+
 /// Timelock delay for decrease_stake during an active loan, in seconds (7 days).
 pub const DECREASE_STAKE_TIMELOCK: u64 = 7 * 24 * 60 * 60;
 

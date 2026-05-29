@@ -366,6 +366,13 @@ fn execute_slash(env: &Env, borrower: &Address) -> Result<(), ContractError> {
     }
     let loan_token = soroban_sdk::token::Client::new(env, &loan.token_address);
 
+    // Calculate total stake backing this borrower (used for loan-size scaling)
+    let total_stake: i128 = vouches.iter().map(|v| v.stake).sum();
+
+    // Determine the effective slash rate, factoring in loan size and/or protocol health
+    let effective_slash_bps =
+        crate::helpers::calculate_effective_slash_bps(env, loan.amount, total_stake);
+
     let mut total_slashed: i128 = 0;
     let mut remaining_vouches: Vec<VouchRecord> = Vec::new(env);
 
@@ -374,7 +381,7 @@ fn execute_slash(env: &Env, borrower: &Address) -> Result<(), ContractError> {
             remaining_vouches.push_back(v);
             continue;
         }
-        let slash_amount = v.stake * cfg.slash_bps / BPS_DENOMINATOR;
+        let slash_amount = v.stake * effective_slash_bps / BPS_DENOMINATOR;
         let remaining = v.stake - slash_amount;
         total_slashed += slash_amount;
 
@@ -460,7 +467,7 @@ fn execute_slash(env: &Env, borrower: &Address) -> Result<(), ContractError> {
 
     env.events().publish(
         (symbol_short!("gov"), symbol_short!("slashed")),
-        (borrower.clone(), total_slashed, slash_id),
+        (borrower.clone(), total_slashed, slash_id, effective_slash_bps),
     );
 
     Ok(())
