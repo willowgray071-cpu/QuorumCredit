@@ -1765,4 +1765,53 @@ impl QuorumCreditContract {
     pub fn get_admin_compensation_pool(env: Env) -> i128 {
         admin::get_admin_compensation_pool(env)
     }
+
+    // ── Issue #656: Loan Guarantee ────────────────────────────────────────────────
+
+    /// Set a guarantor for an active loan.
+    pub fn set_loan_guarantor(
+        env: Env,
+        borrower: Address,
+        guarantor: Address,
+    ) -> Result<(), ContractError> {
+        loan::set_loan_guarantor(env, borrower, guarantor)
+    }
+
+    /// Remove the guarantor from an active loan.
+    pub fn remove_loan_guarantor(env: Env, borrower: Address) -> Result<(), ContractError> {
+        loan::remove_loan_guarantor(env, borrower)
+    }
+
+    // ── Issue #657: Loan Buyback ────────────────────────────────────────────────
+
+    /// Set the buyback price for vouchers to buy back their stake.
+    pub fn set_buyback_price(
+        env: Env,
+        borrower: Address,
+        price: i128,
+    ) -> Result<(), ContractError> {
+        loan::set_buyback_price(env, borrower, price)
+    }
+
+    /// Execute a buyback of vouch for this loan.
+    pub fn buyback_loan(
+        env: Env,
+        voucher: Address,
+        borrower: Address,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        loan::buyback_loan(env, voucher, borrower, amount)
+    }
+
+    // ── Issue #658: Automatic Repayment ───────────────────────────────────────────
+
+    /// Enable automatic repayments for an active loan.
+    pub fn enable_auto_repay(env: Env, borrower: Address) -> Result<(), ContractError> {
+        loan::enable_auto_repay(env, borrower)
+    }
+
+    /// Disable automatic repayments for an active loan.
+    pub fn disable_auto_repay(env: Env, borrower: Address) -> Result<(), ContractError> {
+        loan::disable_auto_repay(env, borrower)
+    }
 }

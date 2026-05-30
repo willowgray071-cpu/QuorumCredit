@@ -131,6 +131,11 @@ pub fn request_loan(
     let loan = LoanRecord {
         id: loan_id,
         borrower: borrower.clone(),
+        guarantor: None,
+        buyback_price: 0,
+        auto_repay_enabled: false,
+        auto_repay_attempts: 0,
+        escrow_status: EscrowStatus::None,
         co_borrowers: Vec::new(&env),
         amount,
         amount_repaid: 0,
@@ -227,17 +232,27 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
     borrower.require_auth();
     require_not_paused(&env)?;
 
-    let mut loan = match get_active_loan_record(&env, &borrower) {
-        Ok(l) => l,
-        Err(ContractError::NoActiveLoan) => {
-            let l = get_latest_loan_record(&env, &borrower).ok_or(ContractError::NoActiveLoan)?;
-            if l.status != LoanStatus::Defaulted {
-                return Err(ContractError::NoActiveLoan);
-            }
-            l
-        }
-        Err(e) => return Err(e),
-    };
+     let mut loan = match get_active_loan_record(&env, &borrower) {
+         Ok(l) => l,
+         Err(ContractError::NoActiveLoan) => {
+             let l = get_latest_loan_record(&env, &borrower).ok_or(ContractError::NoActiveLoan)?;
+             if l.status != LoanStatus::Defaulted {
+                 env.events().publish(
+                     (symbol_short!("loan"), symbol_short!("repayment_failure")),
+                     (borrower.clone(), payment),
+                 );
+                 return Err(ContractError::NoActiveLoan);
+             }
+             l
+         }
+         Err(e) => {
+             env.events().publish(
+                 (symbol_short!("loan"), symbol_short!("repayment_failure")),
+                 (borrower.clone(), payment),
+             );
+             return Err(e);
+         }
+     };
 
     let was_defaulted = loan.status == LoanStatus::Defaulted;
 
@@ -334,7 +349,7 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
                     total_slashed: 0,
                 });
             stats.successful_vouches += 1;
-            stats.total_yield_earned += share;
+            stats.total_yield_earned += vouch_yield;
             env.storage()
                 .persistent()
                 .set(&DataKey::VoucherStats(v.voucher.clone()), &stats);
@@ -615,3 +630,212 @@ pub fn get_extension_request(
 ) -> Option<crate::types::LoanExtensionRequest> {
     None
 }
+
+pub fn defer_payment(env: Env, borrower: Address) -> Result<(), ContractError> {
+    borrower.require_auth();
+    require_not_paused(&env)?;
+    Err(ContractError::InvalidStateTransition)
+}
+
+pub fn check_acceleration(env: Env, _borrower: Address) -> Result<(), ContractError> {
+    Err(ContractError::InvalidStateTransition)
+}
+
+pub fn set_maturity_date(
+    env: Env,
+    admin_signers: Vec<Address>,
+    borrower: Address,
+    _maturity_date: u64,
+) -> Result<(), ContractError> {
+    require_admin_approval(&env, &admin_signers);
+    let mut loan = get_active_loan_record(&env, &borrower)?;
+    loan.maturity_date = Some(_maturity_date);
+    env.storage()
+        .persistent()
+        .set(&DataKey::Loan(loan.id), &loan);
+    Ok(())
+}
+
+pub fn set_loan_rate(
+    env: Env,
+    admin_signers: Vec<Address>,
+    borrower: Address,
+    rate_type: crate::types::RateType,
+    index_reference: Option<soroban_sdk::String>,
+) -> Result<(), ContractError> {
+    require_admin_approval(&env, &admin_signers);
+    let mut loan = get_active_loan_record(&env, &borrower)?;
+    loan.rate_type = rate_type;
+    loan.index_reference = index_reference;
+    env.storage()
+        .persistent()
+        .set(&DataKey::Loan(loan.id), &loan);
+    Ok(())
+}
+
+// ── Issue #656: Loan Guarantee ────────────────────────────────────────────────
+
+pub fn set_loan_guarantor(
+    env: Env,
+    borrower: Address,
+    guarantor: Address,
+) -> Result<(), ContractError> {
+    borrower.require_auth();
+    require_not_paused(&env)?;
+
+    let mut loan = get_active_loan_record(&env, &borrower)?;
+
+    if loan.guarantor.is_some() {
+        return Err(ContractError::InvalidStateTransition);
+    }
+
+    loan.guarantor = Some(guarantor);
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::Loan(loan.id), &loan);
+
+    env.events().publish(
+        (symbol_short!("loan"), symbol_short!("guarantor")),
+        (borrower, guarantor),
+    );
+
+    Ok(())
+}
+
+pub fn remove_loan_guarantor(env: Env, borrower: Address) -> Result<(), ContractError> {
+    borrower.require_auth();
+    require_not_paused(&env)?;
+
+    let mut loan = get_active_loan_record(&env, &borrower)?;
+    loan.guarantor = None;
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::Loan(loan.id), &loan);
+
+    Ok(())
+}
+
+// ── Issue #657: Loan Buyback ────────────────────────────────────────────────
+
+pub fn set_buyback_price(
+    env: Env,
+    borrower: Address,
+    price: i128,
+) -> Result<(), ContractError> {
+    borrower.require_auth();
+    require_not_paused(&env)?;
+
+    let mut loan = get_active_loan_record(&env, &borrower)?;
+
+    if price < 0 {
+        return Err(ContractError::InvalidAmount);
+    }
+
+    loan.buyback_price = price;
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::Loan(loan.id), &loan);
+
+    env.events().publish(
+        (symbol_short!("loan"), symbol_short!("buyback_set")),
+        (borrower, price),
+    );
+
+    Ok(())
+}
+
+pub fn buyback_loan(
+    env: Env,
+    voucher: Address,
+    borrower: Address,
+    amount: i128,
+) -> Result<(), ContractError> {
+    voucher.require_auth();
+    require_not_paused(&env)?;
+
+    let loan = get_active_loan_record(&env, &borrower)?;
+
+    if loan.buyback_price == 0 {
+        return Err(ContractError::InvalidStateTransition);
+    }
+
+    let total_stake: i128 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Vouches(borrower.clone()))
+        .unwrap_or(Vec::new(&env))
+        .iter()
+        .filter(|v| v.voucher == voucher && v.token == loan.token_address)
+        .map(|v| v.stake)
+        .sum();
+
+    if total_stake == 0 {
+        return Err(ContractError::VoucherNotFound);
+    }
+
+    let cost = total_stake * loan.buyback_price / BPS_DENOMINATOR;
+    if amount < cost {
+        return Err(ContractError::InvalidAmount);
+    }
+
+    let token_client = require_allowed_token(&env, &loan.token_address)?;
+    token_client.transfer(&voucher, &env.current_contract_address(), &cost);
+    token_client.transfer(&env.current_contract_address(), &voucher, &total_stake);
+
+    env.events().publish(
+        (symbol_short!("loan"), symbol_short!("buyback")),
+        (borrower, voucher, cost, total_stake),
+    );
+
+    Ok(())
+}
+
+// ── Issue #658: Automatic Repayment ───────────────────────────────────────────
+
+pub fn enable_auto_repay(env: Env, borrower: Address) -> Result<(), ContractError> {
+    borrower.require_auth();
+    require_not_paused(&env)?;
+
+    let mut loan = get_active_loan_record(&env, &borrower)?;
+
+    if loan.auto_repay_enabled {
+        return Err(ContractError::InvalidStateTransition);
+    }
+
+    loan.auto_repay_enabled = true;
+    loan.auto_repay_attempts = 0;
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::Loan(loan.id), &loan);
+
+    env.events().publish(
+        (symbol_short!("loan"), symbol_short!("auto_repay_on")),
+        borrower,
+    );
+
+    Ok(())
+}
+
+pub fn disable_auto_repay(env: Env, borrower: Address) -> Result<(), ContractError> {
+    borrower.require_auth();
+    require_not_paused(&env)?;
+
+    let mut loan = get_active_loan_record(&env, &borrower)?;
+    loan.auto_repay_enabled = false;
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::Loan(loan.id), &loan);
+
+    env.events().publish(
+        (symbol_short!("loan"), symbol_short!("auto_repay_off")),
+        borrower,
+    );
+
+    Ok(())
+}
+

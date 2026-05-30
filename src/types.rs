@@ -422,7 +422,17 @@ pub struct AmortizationEntry {
 pub struct LoanRecord {
     pub id: u64,
     pub borrower: Address,
-    pub co_borrowers: Vec<Address>,
+    /// #656: Third-party guarantor for this loan (None if no guarantor).
+    pub guarantor: Option<Address>,
+    /// #657: Buyback price set by borrower for vouchers to buy back stake (0 = not available).
+    pub buyback_price: i128,
+    /// #658: Whether automatic repayments are enabled for this loan.
+    pub auto_repay_enabled: bool,
+    /// #658: Number of repayment attempts made (for tracking auto-repay retries).
+    pub auto_repay_attempts: u32,
+    /// #666/#667: Escrow status for oracle-verified repayments.
+    pub escrow_status: EscrowStatus,
+    co_borrowers: Vec<Address>,
     /// Total loan principal disbursed, in stroops. 1 XLM = 10,000,000 stroops.
     pub amount: i128,
     /// Cumulative repayments received so far (principal + yield), in stroops.

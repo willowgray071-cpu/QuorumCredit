@@ -19,6 +19,10 @@ test_snapshots/
 # Windows installer binaries
 *.exe
 
+# Backup files
+*.bak
+*~
+
 # IDE / editor
 .vscode/
 .idea/
