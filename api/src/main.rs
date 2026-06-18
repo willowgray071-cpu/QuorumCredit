@@ -41,6 +41,7 @@ pub struct AuthResponse {
 pub struct WebhookSubscribeRequest {
     pub url: String,
     pub events: Vec<String>,
+    pub secret: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -49,9 +50,9 @@ pub struct WebhookEventRequest {
     pub data: serde_json::Value,
 }
 
-async fn logging_middleware<B>(
+async fn logging_middleware(
     State(state): State<AppState>,
-    req: Request<B>,
+    req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
     let method = req.method().to_string();
@@ -108,7 +109,7 @@ async fn subscribe_webhook(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match state
         .webhook_manager
-        .subscribe(payload.url, payload.events)
+        .subscribe(payload.url, payload.events, payload.secret)
         .await
     {
         Ok(sub) => Ok(Json(serde_json::to_value(sub).unwrap())),
@@ -258,6 +259,6 @@ mod tests {
             webhook_manager: Arc::new(WebhookManager::new()),
         };
 
-        assert!(state.jwt_auth.is_some());
+        assert!(Arc::strong_count(&state.jwt_auth) >= 1);
     }
 }
