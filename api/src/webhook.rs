@@ -5,6 +5,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use reqwest::Client;
 use thiserror::Error;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 
 #[derive(Error, Debug)]
 pub enum WebhookError {
@@ -29,6 +31,7 @@ pub struct WebhookSubscription {
     pub id: String,
     pub url: String,
     pub events: Vec<String>,
+    pub secret: Option<String>,
     pub active: bool,
     pub created_at: DateTime<Utc>,
     pub retry_count: u32,
@@ -73,6 +76,7 @@ impl WebhookManager {
         &self,
         url: String,
         events: Vec<String>,
+        secret: Option<String>,
     ) -> Result<WebhookSubscription, WebhookError> {
         if !url.starts_with("http://") && !url.starts_with("https://") {
             return Err(WebhookError::InvalidUrl);
@@ -82,10 +86,11 @@ impl WebhookManager {
             id: Uuid::new_v4().to_string(),
             url,
             events,
+            secret,
             active: true,
             created_at: Utc::now(),
             retry_count: 0,
-            max_retries: 3,
+            max_retries: 5,
         };
 
         let mut subs = self.subscriptions.lock().await;
@@ -95,6 +100,7 @@ impl WebhookManager {
             webhook_id = %subscription.id,
             url = %subscription.url,
             events = ?subscription.events,
+            secret_configured = subscription.secret.is_some(),
             "Webhook subscription created"
         );
 
@@ -114,7 +120,7 @@ impl WebhookManager {
 
     pub async fn deliver_event(&self, event: WebhookEvent) -> Result<(), WebhookError> {
         let subs = self.subscriptions.lock().await;
-        
+
         for sub in subs.iter().filter(|s| s.active && s.events.contains(&event.event_type)) {
             let delivery = WebhookDelivery {
                 id: Uuid::new_v4().to_string(),
@@ -126,23 +132,37 @@ impl WebhookManager {
                 error: None,
             };
 
+            let delivery_id = delivery.id.clone();
+
             let mut deliveries = self.deliveries.lock().await;
-            deliveries.push(delivery.clone());
+            deliveries.push(delivery);
             drop(deliveries);
 
-            self.send_webhook(sub.clone(), event.clone()).await;
+            self.send_webhook(sub.clone(), event.clone(), delivery_id).await;
         }
 
         Ok(())
     }
 
-    async fn send_webhook(&self, subscription: WebhookSubscription, event: WebhookEvent) {
-        let delivery_id = Uuid::new_v4().to_string();
+    async fn send_webhook(
+        &self,
+        subscription: WebhookSubscription,
+        event: WebhookEvent,
+        delivery_id: String,
+    ) {
         let mut attempt = 0;
 
         loop {
             attempt += 1;
-            match self.client.post(&subscription.url).json(&event).send().await {
+            let body = serde_json::to_vec(&event).unwrap_or_default();
+            let mut request = self.client.post(&subscription.url).body(body.clone());
+
+            if let Some(secret) = &subscription.secret {
+                let signature = self.sign_payload(secret, &body);
+                request = request.header("X-Webhook-Signature", signature);
+            }
+
+            match request.send().await {
                 Ok(response) => {
                     let status_code = response.status().as_u16();
                     let delivery_status = if response.status().is_success() {
@@ -151,8 +171,13 @@ impl WebhookManager {
                         DeliveryStatus::Failed
                     };
 
-                    self.update_delivery(&delivery_id, delivery_status, Some(status_code), None)
-                        .await;
+                    self.update_delivery(
+                        &delivery_id,
+                        delivery_status,
+                        Some(status_code),
+                        None,
+                    )
+                    .await;
 
                     tracing::info!(
                         delivery_id = %delivery_id,
@@ -163,28 +188,34 @@ impl WebhookManager {
                     break;
                 }
                 Err(e) => {
-                    if attempt < subscription.max_retries {
-                        let status = if attempt < subscription.max_retries - 1 {
-                            DeliveryStatus::Retrying
-                        } else {
-                            DeliveryStatus::Failed
-                        };
-                        self.update_delivery(&delivery_id, status, None, Some(e.to_string()))
-                            .await;
+                    if attempt <= subscription.max_retries {
+                        let delay = self.calculate_backoff(attempt);
+                        self.update_delivery(
+                            &delivery_id,
+                            DeliveryStatus::Retrying,
+                            None,
+                            Some(format!("{e} (retrying in {delay}s)")),
+                        )
+                        .await;
 
                         tracing::warn!(
                             delivery_id = %delivery_id,
                             webhook_id = %subscription.id,
                             attempt = attempt,
                             error = %e,
+                            retry_in_secs = delay,
                             "Webhook delivery failed, retrying"
                         );
 
-                        tokio::time::sleep(tokio::time::Duration::from_secs(2_u64.pow(attempt as u32)))
-                            .await;
+                        tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
                     } else {
-                        self.update_delivery(&delivery_id, DeliveryStatus::Failed, None, Some(e.to_string()))
-                            .await;
+                        self.update_delivery(
+                            &delivery_id,
+                            DeliveryStatus::Failed,
+                            None,
+                            Some(e.to_string()),
+                        )
+                        .await;
 
                         tracing::error!(
                             delivery_id = %delivery_id,
@@ -197,6 +228,25 @@ impl WebhookManager {
                 }
             }
         }
+    }
+
+    fn sign_payload(&self, secret: &str, body: &[u8]) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+            .expect("HMAC can initialize with any key length");
+        mac.update(body);
+        let result = mac.finalize().into_bytes();
+        format!("sha256={}", hex::encode(result))
+    }
+
+    fn calculate_backoff(&self, attempt: u32) -> u64 {
+        let mut delay = 1u64;
+        for _ in 0..attempt.saturating_sub(1) {
+            delay = delay.saturating_mul(2);
+            if delay >= 16 {
+                return 16;
+            }
+        }
+        delay
     }
 
     async fn update_delivery(
@@ -240,6 +290,7 @@ mod tests {
             .subscribe(
                 "https://example.com/webhook".to_string(),
                 vec!["loan.created".to_string()],
+                None,
             )
             .await;
 
@@ -255,6 +306,7 @@ mod tests {
             .subscribe(
                 "invalid-url".to_string(),
                 vec!["loan.created".to_string()],
+                None,
             )
             .await;
 
@@ -268,6 +320,7 @@ mod tests {
             .subscribe(
                 "https://example.com/webhook".to_string(),
                 vec!["loan.created".to_string()],
+                None,
             )
             .await
             .unwrap();
