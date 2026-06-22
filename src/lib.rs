@@ -7,6 +7,7 @@ pub mod governance;
 pub mod helpers;
 pub mod insurance;
 pub mod loan;
+pub mod partial_repayment;
 pub mod reputation;
 pub mod rbac;
 #[cfg(test)]
@@ -48,6 +49,8 @@ mod cross_chain_vouch_test;
 mod property_stake_loan_invariants_test;
 #[cfg(test)]
 mod admin_whitelist_blacklist_test;
+#[cfg(test)]
+mod partial_repayment_test;
 
 use crate::helpers::{
     config, get_active_loan_record, has_active_loan, loan_status as helper_loan_status,
