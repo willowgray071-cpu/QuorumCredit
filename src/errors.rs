@@ -120,4 +120,7 @@ pub enum ContractError {
     CreditScoreNotFound = 114,
     /// Credit score configuration is invalid.
     InvalidCreditConfig = 115,
+    /// A write operation was attempted while the contract is in the Thawing state.
+    /// Only reads and withdrawals are permitted during a thaw period.
+    ContractThawing = 116,
 }

@@ -268,11 +268,55 @@ pub fn upgrade(env: Env, admin_signers: Vec<Address>, new_wasm_hash: BytesN<32>)
 
 pub fn pause(env: Env, admin_signers: Vec<Address>) {
     require_admin_approval(&env, &admin_signers);
+    let now = env.ledger().timestamp();
     env.storage().instance().set(&DataKey::Paused, &true);
     env.storage().instance().set(&DataKey::PauseMode, &crate::types::PauseMode::Paused);
+    // Record the pause timestamp so begin_thaw() can reference it.
+    // ThawState is written with thaw_start_timestamp = 0 (thaw not yet started).
+    env.storage().instance().set(
+        &DataKey::ThawState,
+        &crate::types::ThawState {
+            pause_timestamp: now,
+            thaw_duration: crate::types::THAW_DURATION_SECS,
+            thaw_start_timestamp: 0,
+        },
+    );
     env.events().publish(
         (symbol_short!("admin"), symbol_short!("pause")),
-        (admin_signers.get(0).unwrap(), env.ledger().timestamp()),
+        (admin_signers.get(0).unwrap(), now),
+    );
+}
+
+/// Transition from `Paused` → `Thawing`.
+/// Only reads and withdrawals are allowed during the thaw window (24 h).
+/// After the window elapses the contract auto-transitions back to `Normal`.
+pub fn begin_thaw(env: Env, admin_signers: Vec<Address>) {
+    require_admin_approval(&env, &admin_signers);
+    let mode: crate::types::PauseMode = env
+        .storage()
+        .instance()
+        .get(&DataKey::PauseMode)
+        .unwrap_or(crate::types::PauseMode::None);
+    assert!(
+        mode == crate::types::PauseMode::Paused,
+        "begin_thaw requires contract to be in Paused state"
+    );
+
+    let now = env.ledger().timestamp();
+    // Update existing ThawState with the actual thaw start timestamp.
+    let mut thaw: crate::types::ThawState = env
+        .storage()
+        .instance()
+        .get(&DataKey::ThawState)
+        .expect("pause state not found");
+    thaw.thaw_start_timestamp = now;
+
+    env.storage().instance().set(&DataKey::PauseMode, &crate::types::PauseMode::Thawing);
+    env.storage().instance().set(&DataKey::ThawState, &thaw);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("beg_thaw")),
+        (admin_signers.get(0).unwrap(), now, thaw.thaw_duration),
     );
 }
 
@@ -287,11 +331,12 @@ pub fn unpause(env: Env, admin_signers: Vec<Address>) {
     );
 }
 
-/// Pause the contract with a gradual thaw period allowing emergency withdrawals
+/// Pause the contract and immediately enter Thawing (combined one-step operation).
+/// Writes are blocked immediately; reads and withdrawals allowed for `thaw_duration` seconds.
 pub fn pause_with_thaw(env: Env, admin_signers: Vec<Address>, thaw_duration: u64) {
     require_admin_approval(&env, &admin_signers);
     let now = env.ledger().timestamp();
-    
+
     env.storage().instance().set(&DataKey::Paused, &true);
     env.storage().instance().set(&DataKey::PauseMode, &crate::types::PauseMode::Thawing);
     env.storage().instance().set(
@@ -302,7 +347,7 @@ pub fn pause_with_thaw(env: Env, admin_signers: Vec<Address>, thaw_duration: u64
             thaw_start_timestamp: now,
         },
     );
-    
+
     env.events().publish(
         (symbol_short!("admin"), symbol_short!("pse_thaw")),
         (admin_signers.get(0).unwrap(), now, thaw_duration),
@@ -314,7 +359,7 @@ pub fn is_in_thaw_period(env: &Env) -> bool {
     if let Some(thaw_state) = env.storage().instance().get::<_, crate::types::ThawState>(&DataKey::ThawState) {
         let now = env.ledger().timestamp();
         let thaw_end = thaw_state.thaw_start_timestamp + thaw_state.thaw_duration;
-        now <= thaw_end
+        thaw_state.thaw_start_timestamp > 0 && now <= thaw_end
     } else {
         false
     }

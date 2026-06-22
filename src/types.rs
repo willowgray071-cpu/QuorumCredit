@@ -249,6 +249,36 @@ pub enum RateType {
     Variable,
 }
 
+// ── Pause State Machine ───────────────────────────────────────────────────────
+
+/// Contract pause state for the Normal → Paused → Thawing → Normal state machine.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PauseMode {
+    /// Contract is operating normally.
+    None,
+    /// Contract is fully paused — all writes are blocked.
+    Paused,
+    /// Contract is thawing — only reads and withdrawals are allowed.
+    /// Automatically transitions to `None` after `thaw_duration` seconds.
+    Thawing,
+}
+
+/// Timestamps recorded when the contract enters or exits a thaw period.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ThawState {
+    /// Ledger timestamp when `pause()` was called.
+    pub pause_timestamp: u64,
+    /// Duration of the thaw window in seconds (default 24 h = 86_400).
+    pub thaw_duration: u64,
+    /// Ledger timestamp when `begin_thaw()` was called.
+    pub thaw_start_timestamp: u64,
+}
+
+/// Duration of the thaw period in seconds (24 hours).
+pub const THAW_DURATION_SECS: u64 = 24 * 60 * 60;
+
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
 #[contracttype]
