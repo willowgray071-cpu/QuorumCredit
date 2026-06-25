@@ -1533,6 +1533,38 @@ impl QuorumCreditContract {
         vouch::is_eligible_multi_token(env, borrower, threshold)
     }
 
+    // ── Issue #867: Cross-Collateral Vouch Pools ──────────────────────────────
+
+    /// Create a shared collateral pool; returns the new pool ID.
+    pub fn create_pool(env: Env, creator: Address, token: Address, initial_stake: i128) -> Result<u64, ContractError> {
+        collateral_pool::create_pool(env, creator, token, initial_stake)
+    }
+
+    /// Join an existing pool by contributing stake.
+    pub fn join_pool(env: Env, voucher: Address, pool_id: u64, stake: i128) -> Result<(), ContractError> {
+        collateral_pool::join_pool(env, voucher, pool_id, stake)
+    }
+
+    /// Leave a pool and withdraw stake (only when pool has no active borrower).
+    pub fn leave_pool(env: Env, voucher: Address, pool_id: u64) -> Result<(), ContractError> {
+        collateral_pool::leave_pool(env, voucher, pool_id)
+    }
+
+    /// Admin assigns a pool to back a borrower, locking the collateral.
+    pub fn assign_pool_to_borrower(env: Env, admin_signers: Vec<Address>, pool_id: u64, borrower: Address) -> Result<(), ContractError> {
+        collateral_pool::assign_pool_to_borrower(env, admin_signers, pool_id, borrower)
+    }
+
+    /// Total stake held in a pool.
+    pub fn get_pool_total_stake(env: Env, pool_id: u64) -> Result<i128, ContractError> {
+        collateral_pool::get_pool_total_stake(env, pool_id)
+    }
+
+    /// Read a pool record.
+    pub fn get_pool(env: Env, pool_id: u64) -> Result<crate::types::CollateralPool, ContractError> {
+        collateral_pool::get_pool(env, pool_id)
+    }
+
     pub fn repayment_count(env: Env, borrower: Address) -> u32 {
         loan::repayment_count(env, borrower)
     }

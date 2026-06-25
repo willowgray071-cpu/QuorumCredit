@@ -442,6 +442,24 @@ pub enum DataKey {
     // ── Issue #863: Vouch Cooldown Bypass ────────────────────────────────────
     /// Per-voucher emergency bypass flag: voucher → bool
     EmergencyCooldownBypass(Address),
+    // ── Issue #867: Cross-Collateral Vouch Pools ─────────────────────────────
+    CollateralPool(u64),
+    CollateralPoolCounter,
+    BorrowerPool(Address, u64),
+}
+
+/// Issue #867: Shared collateral pool backed by multiple vouchers.
+#[contracttype]
+#[derive(Clone)]
+pub struct CollateralPool {
+    pub pool_id: u64,
+    pub members: Vec<Address>,
+    /// Stake per member (parallel to `members`), in stroops.
+    pub stakes: Vec<i128>,
+    pub token: Address,
+    pub borrower: Option<Address>,
+    pub active: bool,
+    pub created_at: u64,
 }
 
 // ── Governance ────────────────────────────────────────────────────────────────
