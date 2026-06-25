@@ -1565,6 +1565,28 @@ impl QuorumCreditContract {
         collateral_pool::get_pool(env, pool_id)
     }
 
+    // ── Issue #868: Gradual Unstaking ─────────────────────────────────────────
+
+    /// Schedule progressive stake revocation across `instalments` tranches.
+    pub fn start_gradual_unstake(env: Env, voucher: Address, borrower: Address, instalments: u32, interval_secs: u64) -> Result<(), ContractError> {
+        gradual_unstake::start_gradual_unstake(env, voucher, borrower, instalments, interval_secs)
+    }
+
+    /// Claim the next instalment of an active gradual-unstake schedule.
+    pub fn claim_gradual_instalment(env: Env, voucher: Address, borrower: Address) -> Result<i128, ContractError> {
+        gradual_unstake::claim_gradual_instalment(env, voucher, borrower)
+    }
+
+    /// Cancel a gradual-unstake schedule and return remaining stake immediately.
+    pub fn cancel_gradual_unstake(env: Env, voucher: Address, borrower: Address) -> Result<(), ContractError> {
+        gradual_unstake::cancel_gradual_unstake(env, voucher, borrower)
+    }
+
+    /// Query the active gradual-unstake schedule for a (voucher, borrower) pair.
+    pub fn get_gradual_unstake_schedule(env: Env, voucher: Address, borrower: Address) -> Option<crate::types::GradualUnstakeSchedule> {
+        gradual_unstake::get_gradual_unstake_schedule(env, voucher, borrower)
+    }
+
     pub fn repayment_count(env: Env, borrower: Address) -> u32 {
         loan::repayment_count(env, borrower)
     }

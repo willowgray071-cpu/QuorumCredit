@@ -160,4 +160,10 @@ CollateralPoolNotFound = 132,
 CollateralPoolActive = 133,
 /// Caller is not a member of the specified collateral pool.
 NotPoolMember = 134,
+/// Gradual-unstake schedule not found for this voucher/borrower pair.
+GradualUnstakeNotFound = 135,
+/// A gradual-unstake schedule is already active for this pair.
+GradualUnstakeAlreadyActive = 136,
+/// The next instalment is not yet due.
+GradualUnstakeNotDue = 137,
 }
