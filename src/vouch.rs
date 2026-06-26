@@ -1084,6 +1084,26 @@ pub fn revoke_delegation(
         .get(&DataKey::Vouches(borrower.clone()))
         .ok_or(ContractError::NoVouchesForBorrower)?;
 
+    let idx = vouches
+        .iter()
+        .position(|v| v.voucher == voucher && v.token == token)
+        .ok_or(ContractError::VoucherNotFound)? as u32;
+
+    vouches.remove(idx);
+
+    if vouches.is_empty() {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Vouches(borrower));
+    } else {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Vouches(borrower), &vouches);
+    }
+
+    Ok(())
+}
+
 pub fn set_vouch_expiry(
     env: Env,
     voucher: Address,
@@ -1305,6 +1325,52 @@ pub fn total_vouched(env: Env, borrower: Address) -> Result<i128, ContractError>
         .map(|v| v.stake)
         .sum();
     Ok(total)
+}
+
+/// Issue #864: Aggregate stake across all allowed tokens for a borrower.
+/// Sums every non-expired vouch regardless of token, enabling heterogeneous
+/// collateral baskets (XLM + other SEP-41 tokens).
+pub fn total_vouched_all_tokens(env: Env, borrower: Address) -> Result<i128, ContractError> {
+    let vouches: Vec<VouchRecord> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Vouches(borrower))
+        .unwrap_or(Vec::new(&env));
+
+    let mut total: i128 = 0;
+    for v in vouches.iter() {
+        total = total.checked_add(v.stake).ok_or(ContractError::StakeOverflow)?;
+    }
+    Ok(total)
+}
+
+/// Issue #864: Check loan eligibility based on aggregated multi-token stake.
+/// Returns `true` when the sum of all non-expired vouches across every accepted
+/// token is at least `threshold` stroops.
+pub fn is_eligible_multi_token(env: Env, borrower: Address, threshold: i128) -> bool {
+    let cfg = crate::helpers::config(&env);
+    let now = env.ledger().timestamp();
+    let vouches: Vec<VouchRecord> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Vouches(borrower))
+        .unwrap_or(Vec::new(&env));
+
+    let mut total: i128 = 0;
+    for v in vouches.iter() {
+        let is_accepted =
+            v.token == cfg.token || cfg.allowed_tokens.iter().any(|t| t == v.token);
+        if !is_accepted {
+            continue;
+        }
+        if let Some(expiry) = v.expiry_timestamp {
+            if now >= expiry {
+                continue;
+            }
+        }
+        total = total.saturating_add(v.stake);
+    }
+    total >= threshold
 }
 
 /// Admin: set whether a voucher is validated on a given chain.

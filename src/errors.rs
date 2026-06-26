@@ -151,6 +151,19 @@ AppealAlreadyVoted = 128,
 /// Appeal quorum (2/3 voucher stake) not met to overturn slash.
 AppealQuorumNotMet = 129,
 /// Escrow period has expired; appeal can no longer be filed or voted on.
-    EscrowExpired = 130,
-    AttributeNotFound = 131,
+EscrowExpired = 130,
+/// Emergency cooldown bypass is not authorised for this voucher.
+EmergencyBypassNotAuthorised = 131,
+/// Cross-collateral pool not found.
+CollateralPoolNotFound = 132,
+/// Cross-collateral pool is already active (has an assigned borrower).
+CollateralPoolActive = 133,
+/// Caller is not a member of the specified collateral pool.
+NotPoolMember = 134,
+/// Gradual-unstake schedule not found for this voucher/borrower pair.
+GradualUnstakeNotFound = 135,
+/// A gradual-unstake schedule is already active for this pair.
+GradualUnstakeAlreadyActive = 136,
+/// The next instalment is not yet due.
+GradualUnstakeNotDue = 137,
 }
