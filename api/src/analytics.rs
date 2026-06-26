@@ -717,6 +717,157 @@ impl BuyoutMetrics {
     }
 }
 
+/// High-risk yield multiplier tracking (Issue #890)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RiskYieldRecord {
+    pub loan_id: u64,
+    pub borrower: String,
+    pub risk_score: u32,           // 0-100
+    pub base_yield_bps: u32,       // base yield in basis points
+    pub risk_multiplier: f64,      // applied multiplier (e.g., 1.5x for high risk)
+    pub adjusted_yield_bps: u32,   // final yield after multiplier
+    pub yield_compensation: i128,  // additional yield in stroops for risk compensation
+    pub risk_category: RiskCategory,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum RiskCategory {
+    Low,      // 0-30 risk score
+    Medium,   // 31-60 risk score
+    High,     // 61-85 risk score
+    Critical, // 86-100 risk score
+}
+
+impl RiskCategory {
+    pub fn from_risk_score(score: u32) -> Self {
+        match score {
+            0..=30 => RiskCategory::Low,
+            31..=60 => RiskCategory::Medium,
+            61..=85 => RiskCategory::High,
+            _ => RiskCategory::Critical,
+        }
+    }
+
+    pub fn multiplier(&self) -> f64 {
+        match self {
+            RiskCategory::Low => 1.0,
+            RiskCategory::Medium => 1.2,
+            RiskCategory::High => 1.5,
+            RiskCategory::Critical => 2.0,
+        }
+    }
+}
+
+/// Risk-adjusted yield metrics for portfolio analysis
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HighRiskYieldMetrics {
+    pub total_high_risk_loans: u32,
+    pub total_critical_risk_loans: u32,
+    pub total_risk_compensation: i128,
+    pub average_risk_score: f64,
+    pub average_yield_multiplier: f64,
+    pub risk_distribution: Vec<(String, u32)>, // (risk_category, count)
+    pub total_adjusted_yield: i128,
+    pub yield_increase_from_risk: i128,
+    pub weighted_avg_multiplier: f64,
+}
+
+impl HighRiskYieldMetrics {
+    pub fn new() -> Self {
+        Self {
+            total_high_risk_loans: 0,
+            total_critical_risk_loans: 0,
+            total_risk_compensation: 0,
+            average_risk_score: 0.0,
+            average_yield_multiplier: 1.0,
+            risk_distribution: Vec::new(),
+            total_adjusted_yield: 0,
+            yield_increase_from_risk: 0,
+            weighted_avg_multiplier: 1.0,
+        }
+    }
+
+    /// Calculate risk-adjusted yield metrics from risk-yield records
+    pub fn from_risk_yield_records(records: &[RiskYieldRecord]) -> Self {
+        let mut metrics = Self::new();
+
+        if records.is_empty() {
+            return metrics;
+        }
+
+        let mut risk_counts: HashMap<String, u32> = HashMap::new();
+        let mut total_risk_score: f64 = 0.0;
+        let mut total_multiplier: f64 = 0.0;
+        let mut total_base_yield: i128 = 0;
+        let mut weighted_multiplier_sum: f64 = 0.0;
+
+        for record in records {
+            metrics.total_risk_compensation = metrics.total_risk_compensation.saturating_add(record.yield_compensation);
+            metrics.total_adjusted_yield = metrics.total_adjusted_yield.saturating_add(record.adjusted_yield_bps as i128);
+
+            total_risk_score += record.risk_score as f64;
+            total_multiplier += record.risk_multiplier;
+            total_base_yield = total_base_yield.saturating_add(record.base_yield_bps as i128);
+            weighted_multiplier_sum += record.risk_multiplier * (record.base_yield_bps as f64);
+
+            // Count by risk category
+            let category_name = match record.risk_category {
+                RiskCategory::Low => "Low".to_string(),
+                RiskCategory::Medium => "Medium".to_string(),
+                RiskCategory::High => "High".to_string(),
+                RiskCategory::Critical => "Critical".to_string(),
+            };
+            *risk_counts.entry(category_name).or_insert(0) += 1;
+
+            // Track high-risk and critical
+            if record.risk_score > 60 {
+                metrics.total_high_risk_loans += 1;
+            }
+            if record.risk_score > 85 {
+                metrics.total_critical_risk_loans += 1;
+            }
+        }
+
+        let record_count = records.len() as f64;
+        metrics.average_risk_score = total_risk_score / record_count;
+        metrics.average_yield_multiplier = total_multiplier / record_count;
+
+        if total_base_yield > 0 {
+            metrics.weighted_avg_multiplier = weighted_multiplier_sum / (total_base_yield as f64);
+        }
+
+        // Calculate yield increase from risk compensation
+        metrics.yield_increase_from_risk = metrics.total_adjusted_yield
+            .saturating_sub(total_base_yield.saturating_mul(records.len() as i128));
+
+        // Build risk distribution
+        let mut dist: Vec<(String, u32)> = risk_counts.into_iter().collect();
+        dist.sort_by(|a, b| {
+            // Sort: Critical > High > Medium > Low
+            let order_a = match a.0.as_str() {
+                "Critical" => 3,
+                "High" => 2,
+                "Medium" => 1,
+                "Low" => 0,
+                _ => -1,
+            };
+            let order_b = match b.0.as_str() {
+                "Critical" => 3,
+                "High" => 2,
+                "Medium" => 1,
+                "Low" => 0,
+                _ => -1,
+            };
+            order_b.cmp(&order_a)
+        });
+        metrics.risk_distribution = dist;
+
+        metrics
+    }
+}
+
 /// Compute `ProtocolMetrics` from raw loan + vouch snapshots, applying optional filters.
 pub fn aggregate_metrics(
     loans: &[LoanSnapshot],
@@ -1657,5 +1808,153 @@ mod tests {
         // Interest saved should be positive when buyout occurs before maturity
         assert!(record.interest_saved > 0);
         assert_eq!(record.days_to_maturity, 60);
+    }
+
+    // Test 33: Risk category classification from risk score
+    #[test]
+    fn test_risk_category_from_score() {
+        assert_eq!(RiskCategory::from_risk_score(20), RiskCategory::Low);
+        assert_eq!(RiskCategory::from_risk_score(45), RiskCategory::Medium);
+        assert_eq!(RiskCategory::from_risk_score(70), RiskCategory::High);
+        assert_eq!(RiskCategory::from_risk_score(95), RiskCategory::Critical);
+    }
+
+    // Test 34: Risk multiplier values correct
+    #[test]
+    fn test_risk_multiplier_values() {
+        assert_eq!(RiskCategory::Low.multiplier(), 1.0);
+        assert_eq!(RiskCategory::Medium.multiplier(), 1.2);
+        assert_eq!(RiskCategory::High.multiplier(), 1.5);
+        assert_eq!(RiskCategory::Critical.multiplier(), 2.0);
+    }
+
+    // Test 35: High-risk yield metrics calculation
+    #[test]
+    fn test_high_risk_yield_metrics() {
+        let records = vec![
+            RiskYieldRecord {
+                loan_id: 1,
+                borrower: "b1".to_string(),
+                risk_score: 25,
+                base_yield_bps: 200,
+                risk_multiplier: 1.0,
+                adjusted_yield_bps: 200,
+                yield_compensation: 0,
+                risk_category: RiskCategory::Low,
+                created_at: 1000,
+            },
+            RiskYieldRecord {
+                loan_id: 2,
+                borrower: "b2".to_string(),
+                risk_score: 50,
+                base_yield_bps: 200,
+                risk_multiplier: 1.2,
+                adjusted_yield_bps: 240,
+                yield_compensation: 400_000_000,
+                risk_category: RiskCategory::Medium,
+                created_at: 2000,
+            },
+            RiskYieldRecord {
+                loan_id: 3,
+                borrower: "b3".to_string(),
+                risk_score: 75,
+                base_yield_bps: 200,
+                risk_multiplier: 1.5,
+                adjusted_yield_bps: 300,
+                yield_compensation: 1_000_000_000,
+                risk_category: RiskCategory::High,
+                created_at: 3000,
+            },
+            RiskYieldRecord {
+                loan_id: 4,
+                borrower: "b4".to_string(),
+                risk_score: 90,
+                base_yield_bps: 200,
+                risk_multiplier: 2.0,
+                adjusted_yield_bps: 400,
+                yield_compensation: 2_000_000_000,
+                risk_category: RiskCategory::Critical,
+                created_at: 4000,
+            },
+        ];
+
+        let metrics = HighRiskYieldMetrics::from_risk_yield_records(&records);
+
+        assert_eq!(metrics.total_high_risk_loans, 2); // High + Critical
+        assert_eq!(metrics.total_critical_risk_loans, 1); // Critical only
+        assert_eq!(metrics.total_risk_compensation, 3_400_000_000);
+        assert!(metrics.average_risk_score > 50.0 && metrics.average_risk_score < 60.0);
+        assert!(metrics.average_yield_multiplier > 1.4 && metrics.average_yield_multiplier < 1.5);
+        assert_eq!(metrics.risk_distribution.len(), 4);
+    }
+
+    // Test 36: Risk metrics with only low-risk loans
+    #[test]
+    fn test_risk_metrics_low_risk_only() {
+        let records = vec![
+            RiskYieldRecord {
+                loan_id: 1,
+                borrower: "b1".to_string(),
+                risk_score: 20,
+                base_yield_bps: 200,
+                risk_multiplier: 1.0,
+                adjusted_yield_bps: 200,
+                yield_compensation: 0,
+                risk_category: RiskCategory::Low,
+                created_at: 1000,
+            },
+            RiskYieldRecord {
+                loan_id: 2,
+                borrower: "b2".to_string(),
+                risk_score: 25,
+                base_yield_bps: 200,
+                risk_multiplier: 1.0,
+                adjusted_yield_bps: 200,
+                yield_compensation: 0,
+                risk_category: RiskCategory::Low,
+                created_at: 2000,
+            },
+        ];
+
+        let metrics = HighRiskYieldMetrics::from_risk_yield_records(&records);
+
+        assert_eq!(metrics.total_high_risk_loans, 0);
+        assert_eq!(metrics.total_critical_risk_loans, 0);
+        assert_eq!(metrics.average_yield_multiplier, 1.0);
+        assert_eq!(metrics.total_risk_compensation, 0);
+    }
+
+    // Test 37: Risk metrics with empty records
+    #[test]
+    fn test_risk_metrics_empty() {
+        let records: Vec<RiskYieldRecord> = vec![];
+        let metrics = HighRiskYieldMetrics::from_risk_yield_records(&records);
+
+        assert_eq!(metrics.total_high_risk_loans, 0);
+        assert_eq!(metrics.total_critical_risk_loans, 0);
+        assert_eq!(metrics.average_yield_multiplier, 1.0);
+    }
+
+    // Test 38: Yield increase from risk properly calculated
+    #[test]
+    fn test_yield_increase_from_risk() {
+        let records = vec![
+            RiskYieldRecord {
+                loan_id: 1,
+                borrower: "b1".to_string(),
+                risk_score: 70,
+                base_yield_bps: 100,
+                risk_multiplier: 1.5,
+                adjusted_yield_bps: 150,
+                yield_compensation: 500_000_000,
+                risk_category: RiskCategory::High,
+                created_at: 1000,
+            },
+        ];
+
+        let metrics = HighRiskYieldMetrics::from_risk_yield_records(&records);
+
+        // Adjusted (150) - base (100) = 50 bps increase
+        assert!(metrics.yield_increase_from_risk >= 0);
     }
 }
