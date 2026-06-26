@@ -487,6 +487,8 @@ pub enum DataKey {
     QueuedProposalCounter,
     /// ProposalQueueConfig (global configuration for proposal queue system)
     ProposalQueueConfig,
+    /// Issue #893: Multi-tier admin approval thresholds
+    MultiTierAdminThresholds,
 }
 
 /// Issue #867: Shared collateral pool backed by multiple vouchers.
@@ -606,6 +608,55 @@ pub struct ConfigUpdateProposal {
 }
 
 // ── Admin Governance Queue with Multi-Signature Confirmation ─────────────────────
+
+/// Issue #893: Admin operation types for multi-tier approval thresholds.
+/// Different operations can require different numbers of admin approvals based on criticality.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdminOperationType {
+    /// Low-risk operations (e.g., setting parameters like min_stake)
+    Standard,
+    /// Medium-risk operations (e.g., adding/removing tokens, admin changes)
+    HighRisk,
+    /// Critical operations (e.g., contract upgrade, pause, emergency actions)
+    Critical,
+}
+
+/// Issue #893: Multi-tier admin approval thresholds for different operation types.
+/// Allows different admin operations to require different numbers of approvals.
+#[contracttype]
+#[derive(Clone)]
+pub struct MultiTierAdminThresholds {
+    /// Approvals required for standard operations (default: same as admin_threshold)
+    pub standard_threshold: u32,
+    /// Approvals required for high-risk operations (default: 2x standard)
+    pub high_risk_threshold: u32,
+    /// Approvals required for critical operations (default: all admins)
+    pub critical_threshold: u32,
+}
+
+impl MultiTierAdminThresholds {
+    /// Create default thresholds based on total admin count.
+    /// Standard = 1, HighRisk = (total/2)+1, Critical = total
+    pub fn default_for_admin_count(admin_count: u32) -> Self {
+        let high_risk = if admin_count > 1 { (admin_count / 2) + 1 } else { 1 };
+        let critical = admin_count;
+        MultiTierAdminThresholds {
+            standard_threshold: 1,
+            high_risk_threshold: high_risk,
+            critical_threshold: critical,
+        }
+    }
+
+    /// Get the threshold for a specific operation type
+    pub fn get_threshold(&self, operation_type: AdminOperationType) -> u32 {
+        match operation_type {
+            AdminOperationType::Standard => self.standard_threshold,
+            AdminOperationType::HighRisk => self.high_risk_threshold,
+            AdminOperationType::Critical => self.critical_threshold,
+        }
+    }
+}
 
 /// Types of governance actions that can be proposed in the admin governance queue.
 #[contracttype]
@@ -1080,6 +1131,9 @@ pub struct Config {
     /// when current admins are unavailable.
     pub successor_admin: Option<Address>,
     pub rate_limit_config: RateLimitConfig,
+    /// Issue #893: Multi-tier admin approval thresholds for different operation types.
+    /// If not set, falls back to single admin_threshold for all operations.
+    pub multi_tier_thresholds: Option<MultiTierAdminThresholds>,
 }
 
 // ── Data Types ────────────────────────────────────────────────────────────────
