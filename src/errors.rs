@@ -151,5 +151,6 @@ AppealAlreadyVoted = 128,
 /// Appeal quorum (2/3 voucher stake) not met to overturn slash.
 AppealQuorumNotMet = 129,
 /// Escrow period has expired; appeal can no longer be filed or voted on.
-EscrowExpired = 130,
+    EscrowExpired = 130,
+    AttributeNotFound = 131,
 }

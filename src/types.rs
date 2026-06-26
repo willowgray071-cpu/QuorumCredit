@@ -118,6 +118,9 @@ pub const DEFERMENT_PERIOD_SECS: u64 = 30 * 24 * 60 * 60;
 /// Penalty applied to partial mid-loan withdrawals, in basis points (1000 = 10%).
 pub const PARTIAL_WITHDRAWAL_PENALTY_BPS: i128 = 1_000;
 
+/// Yield stream period in seconds (7 days).
+pub const YIELD_STREAM_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RateLimitConfig {
@@ -442,6 +445,14 @@ pub enum DataKey {
     SyndicationRepaymentCounter(u64), // syndication_id → counter
     /// Reputation NFT badge for excellent credit tier: borrower → ReputationNFTRecord
     ReputationNFTBadge(Address),
+    CustomAttributes(Address), // address -> Vec<AttributeEntry>
+    YieldStreamState(u64), // loan_id -> YieldStreamState
+    VoucherYieldClaim(u64, Address), // loan_id, voucher -> VoucherYieldClaim
+    VouchGroup(u64), // group_id -> VouchGroup
+    VouchGroupCounter, // u64 monotonically increasing group ID counter
+    VoucherGroupIds(Address), // voucher -> Vec<u64>
+    PeriodicPaymentConfig(u64), // loan_id -> PeriodicPaymentConfig
+    PeriodicPaymentStatus(u64), // loan_id -> PeriodicPaymentStatus
 }
 
 // ── Governance ────────────────────────────────────────────────────────────────
@@ -1438,4 +1449,74 @@ pub struct ErrorResponse {
     pub details: Option<soroban_sdk::String>,
     /// Timestamp when the error occurred.
     pub timestamp: u64,
+}
+
+// ── Custom Attributes ──────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone)]
+pub struct AttributeEntry {
+    pub key: soroban_sdk::String,
+    pub value: soroban_sdk::String,
+}
+
+// ── Yield Stream ───────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone)]
+pub struct YieldStreamState {
+    pub loan_id: u64,
+    pub last_claim_timestamp: u64,
+    pub total_yield_claimed: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct VoucherYieldClaim {
+    pub voucher: Address,
+    pub loan_id: u64,
+    pub last_claim_timestamp: u64,
+    pub yield_claimed: i128,
+}
+
+// ── Vouch Groups ───────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone)]
+pub struct VouchGroup {
+    pub group_id: u64,
+    pub name: soroban_sdk::String,
+    pub vouchers: Vec<Address>,
+    pub created_at: u64,
+}
+
+// ── Periodic Payments ──────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ScheduleType {
+    Weekly,
+    BiWeekly,
+    Monthly,
+    Quarterly,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct PeriodicPaymentConfig {
+    pub schedule_type: ScheduleType,
+    pub period_count: u32,
+    pub period_interest_bps: u32,
+    pub periods_completed: u32,
+    pub enabled: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct PeriodicPaymentStatus {
+    pub loan_id: u64,
+    pub config: PeriodicPaymentConfig,
+    pub next_period_due: u64,
+    pub last_payment_timestamp: u64,
+    pub total_period_interest_paid: i128,
 }
