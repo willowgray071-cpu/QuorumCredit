@@ -1099,7 +1099,7 @@ pub struct LoanRecord {
     pub auto_repay_attempts: u32,
     /// #666/#667: Escrow status for oracle-verified repayments.
     pub escrow_status: EscrowStatus,
-    co_borrowers: Vec<Address>,
+    pub co_borrowers: Vec<Address>,
     /// Total loan principal disbursed, in stroops. 1 XLM = 10,000,000 stroops.
     pub amount: i128,
     /// Cumulative repayments received so far (principal + yield), in stroops.

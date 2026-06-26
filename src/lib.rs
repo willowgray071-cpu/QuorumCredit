@@ -96,6 +96,15 @@ mod vote_escrow_lock_test;
 #[cfg(test)]
 mod loan_features_test;
 
+#[cfg(test)]
+mod co_borrower_test;
+#[cfg(test)]
+mod dynamic_rate_test;
+#[cfg(test)]
+mod forbearance_test;
+#[cfg(test)]
+mod refinance_test;
+
 use crate::helpers::{
     config, get_active_loan_record, has_active_loan, loan_status as helper_loan_status,
     require_allowed_token, require_not_paused,
@@ -966,6 +975,97 @@ impl QuorumCreditContract {
 
     pub fn loan_status(env: Env, borrower: Address) -> LoanStatus {
         helper_loan_status(&env, &borrower)
+    }
+
+    // ── Issue #880: Loan Co-Borrower Support ─────────────────────────────────
+
+    pub fn add_co_borrower(
+        env: Env,
+        borrower: Address,
+        co_borrower: Address,
+    ) -> Result<(), ContractError> {
+        loan::add_co_borrower(env, borrower, co_borrower)
+    }
+
+    pub fn remove_co_borrower(
+        env: Env,
+        borrower: Address,
+        co_borrower: Address,
+    ) -> Result<(), ContractError> {
+        loan::remove_co_borrower(env, borrower, co_borrower)
+    }
+
+    pub fn get_co_borrowers(env: Env, borrower: Address) -> Vec<Address> {
+        loan::get_co_borrowers(env, borrower)
+    }
+
+    // ── Issue #881: Dynamic Interest Rate ────────────────────────────────────
+
+    pub fn set_dynamic_rate_config(
+        env: Env,
+        admin_signers: Vec<Address>,
+        config: DynamicRateConfig,
+    ) -> Result<(), ContractError> {
+        loan::set_dynamic_rate_config(env, admin_signers, config)
+    }
+
+    pub fn get_dynamic_rate_config(env: Env) -> DynamicRateConfig {
+        loan::get_dynamic_rate_config_view(env)
+    }
+
+    pub fn compute_dynamic_rate(
+        env: Env,
+        admin_signers: Vec<Address>,
+        borrower: Address,
+    ) -> Result<u32, ContractError> {
+        loan::compute_and_store_dynamic_rate(env, admin_signers, borrower)
+    }
+
+    pub fn get_borrower_dynamic_rate(env: Env, borrower: Address) -> Option<BorrowerDynamicRate> {
+        loan::get_borrower_dynamic_rate(env, borrower)
+    }
+
+    // ── Issue #878: Loan Forbearance Period ──────────────────────────────────
+
+    pub fn request_forbearance(
+        env: Env,
+        borrower: Address,
+        duration_secs: Option<u64>,
+    ) -> Result<(), ContractError> {
+        loan::request_forbearance(env, borrower, duration_secs)
+    }
+
+    pub fn end_forbearance(env: Env, borrower: Address) -> Result<(), ContractError> {
+        loan::end_forbearance(env, borrower)
+    }
+
+    pub fn get_forbearance(env: Env, loan_id: u64) -> Option<ForbearanceRecord> {
+        loan::get_forbearance(env, loan_id)
+    }
+
+    // ── Issue #879: Loan Refinancing ─────────────────────────────────────────
+
+    pub fn refinance_loan(
+        env: Env,
+        borrower: Address,
+        new_amount: i128,
+        new_threshold: i128,
+        new_token: Address,
+    ) -> Result<(), ContractError> {
+        loan::refinance_loan(env, borrower, new_amount, new_threshold, new_token)
+    }
+
+    pub fn get_refinance_record(env: Env, loan_id: u64) -> Option<RefinanceRecord> {
+        loan::get_refinance_record(env, loan_id)
+    }
+
+    pub fn set_borrower_risk_score(
+        env: Env,
+        admin_signers: Vec<Address>,
+        borrower: Address,
+        risk_score: u32,
+    ) -> Result<(), ContractError> {
+        loan::set_borrower_risk_score(env, admin_signers, borrower, risk_score)
     }
 
     // ── Governance: slash voting ──────────────────────────────────────────────

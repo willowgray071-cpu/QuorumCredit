@@ -6,8 +6,11 @@ use crate::helpers::{
 };
 use crate::reputation::ReputationNftExternalClient;
 use crate::types::{
-    DataKey, EscrowStatus, LoanRecord, LoanStatus, SlashRecord, VouchRecord, VoucherStats,
-    BPS_DENOMINATOR, REPUTATION_BONUS_MAX_BPS, SLASH_ESCROW_PERIOD,
+    BorrowerDynamicRate, DataKey, DynamicRateConfig, EscrowStatus,
+    ForbearanceRecord, ForbearanceStatus, LoanRecord, LoanStatus,
+    RefinanceRecord, SlashRecord, VouchRecord, VoucherStats,
+    BPS_DENOMINATOR, DEFAULT_DYNAMIC_RATE_CONFIG, DEFAULT_FORBEARANCE_DURATION_SECS,
+    MAX_FORBEARANCE_PERIODS, REPUTATION_BONUS_MAX_BPS, SLASH_ESCROW_PERIOD,
 };
 use soroban_sdk::{panic_with_error, symbol_short, Address, Env, Vec};
 
@@ -666,22 +669,230 @@ pub fn get_referrer(_env: Env, _borrower: Address) -> Option<Address> {
     None
 }
 
+// ── Issue #880: Co-Borrower Support ──────────────────────────────────────────
+
+const MAX_CO_BORROWERS: u32 = 5;
+
 pub fn add_co_borrower(
-    _env: Env,
-    _borrower: Address,
-    _co_borrower: Address,
+    env: Env,
+    borrower: Address,
+    co_borrower: Address,
 ) -> Result<(), ContractError> {
-    Err(ContractError::InvalidStateTransition)
+    borrower.require_auth();
+    require_not_paused(&env)?;
+
+    if borrower == co_borrower {
+        return Err(ContractError::SelfCoBorrowerNotAllowed);
+    }
+
+    let mut loan = get_active_loan_record(&env, &borrower)?;
+
+    if loan.co_borrowers.len() >= MAX_CO_BORROWERS {
+        return Err(ContractError::MaxCoBorrowersExceeded);
+    }
+
+    if loan.co_borrowers.iter().any(|cb| cb == co_borrower) {
+        return Err(ContractError::CoBorrowerAlreadyAdded);
+    }
+
+    loan.co_borrowers.push_back(co_borrower.clone());
+    env.storage()
+        .persistent()
+        .set(&DataKey::Loan(loan.id), &loan);
+
+    env.events().publish(
+        (symbol_short!("loan"), symbol_short!("co_add")),
+        (borrower, co_borrower, loan.id),
+    );
+
+    Ok(())
 }
 
-pub fn refinance_loan(
-    _env: Env,
-    _borrower: Address,
-    _new_amount: i128,
-    _new_threshold: i128,
-    _new_token: Address,
+pub fn remove_co_borrower(
+    env: Env,
+    borrower: Address,
+    co_borrower: Address,
 ) -> Result<(), ContractError> {
-    Err(ContractError::InvalidStateTransition)
+    borrower.require_auth();
+    require_not_paused(&env)?;
+
+    let mut loan = get_active_loan_record(&env, &borrower)?;
+
+    let idx = loan.co_borrowers.iter().position(|cb| cb == co_borrower);
+    match idx {
+        Some(i) => {
+            loan.co_borrowers.remove(i as u32);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Loan(loan.id), &loan);
+
+            env.events().publish(
+                (symbol_short!("loan"), symbol_short!("co_rm")),
+                (borrower, co_borrower, loan.id),
+            );
+
+            Ok(())
+        }
+        None => Err(ContractError::VoucherNotFound),
+    }
+}
+
+pub fn get_co_borrowers(env: Env, borrower: Address) -> Vec<Address> {
+    match get_active_loan_record(&env, &borrower) {
+        Ok(loan) => loan.co_borrowers,
+        Err(_) => Vec::new(&env),
+    }
+}
+
+// ── Issue #879: Loan Refinancing ─────────────────────────────────────────────
+
+pub fn refinance_loan(
+    env: Env,
+    borrower: Address,
+    new_amount: i128,
+    new_threshold: i128,
+    new_token: Address,
+) -> Result<(), ContractError> {
+    borrower.require_auth();
+    require_not_thawing(&env)?;
+    crate::helpers::check_rate_limit(&env, &borrower)?;
+
+    let mut old_loan = get_active_loan_record(&env, &borrower)?;
+
+    let total_owed = old_loan.amount
+        .checked_add(old_loan.total_yield)
+        .ok_or(ContractError::ArithmeticError)?;
+    let outstanding = total_owed
+        .checked_sub(old_loan.amount_repaid)
+        .ok_or(ContractError::ArithmeticError)?;
+
+    if outstanding <= 0 {
+        return Err(ContractError::RefinanceNoOutstanding);
+    }
+
+    if new_amount < outstanding {
+        return Err(ContractError::InvalidAmount);
+    }
+
+    let cfg = config(&env);
+    if new_amount < cfg.min_loan_amount {
+        return Err(ContractError::LoanBelowMinAmount);
+    }
+
+    let token = require_allowed_token(&env, &new_token)?;
+
+    let vouches: Vec<VouchRecord> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Vouches(borrower.clone()))
+        .unwrap_or(Vec::new(&env));
+
+    let total_stake: i128 = vouches
+        .iter()
+        .filter(|v| v.token == new_token)
+        .map(|v| {
+            let weight = crate::vouch::vouch_reputation_weight(&env, &v.voucher);
+            v.stake * weight / BPS_DENOMINATOR
+        })
+        .sum();
+
+    if total_stake < new_threshold {
+        return Err(ContractError::InsufficientFunds);
+    }
+
+    let now = env.ledger().timestamp();
+    let old_rate_bps = cfg.yield_bps;
+
+    old_loan.status = LoanStatus::Repaid;
+    old_loan.repayment_timestamp = Some(now);
+    env.storage()
+        .persistent()
+        .set(&DataKey::Loan(old_loan.id), &old_loan);
+    env.storage()
+        .persistent()
+        .remove(&DataKey::ActiveLoan(borrower.clone()));
+
+    let new_loan_id = next_loan_id(&env);
+    let new_yield_bps = crate::credit_score::apply_tier_rewards_to_yield(
+        &env, &borrower, cfg.yield_bps,
+    );
+    let new_yield = new_amount * new_yield_bps / 10_000;
+
+    let new_loan = LoanRecord {
+        id: new_loan_id,
+        borrower: borrower.clone(),
+        guarantor: old_loan.guarantor,
+        buyback_price: 0,
+        auto_repay_enabled: false,
+        auto_repay_attempts: 0,
+        escrow_status: EscrowStatus::None,
+        co_borrowers: old_loan.co_borrowers,
+        amount: new_amount,
+        amount_repaid: 0,
+        total_yield: new_yield,
+        status: LoanStatus::Active,
+        created_at: now,
+        disbursement_timestamp: now,
+        repayment_timestamp: None,
+        deadline: now + cfg.loan_duration,
+        loan_purpose: old_loan.loan_purpose,
+        token_address: new_token.clone(),
+        amortization_schedule: Vec::new(&env),
+        reminder_sent: false,
+        risk_score: old_loan.risk_score,
+        deferment_periods: 0,
+        maturity_date: None,
+        rate_type: old_loan.rate_type,
+        index_reference: old_loan.index_reference,
+        last_interest_calc: now,
+        accrued_interest: 0,
+        milestone_bonus_applied: false,
+        retry_count: 0,
+    };
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::Loan(new_loan_id), &new_loan);
+    env.storage()
+        .persistent()
+        .set(&DataKey::ActiveLoan(borrower.clone()), &new_loan_id);
+    env.storage()
+        .persistent()
+        .set(&DataKey::LatestLoan(borrower.clone()), &new_loan_id);
+
+    let net_disbursement = new_amount
+        .checked_sub(outstanding)
+        .ok_or(ContractError::ArithmeticError)?;
+    if net_disbursement > 0 {
+        token.transfer(&env.current_contract_address(), &borrower, &net_disbursement);
+    }
+
+    let refinance_record = RefinanceRecord {
+        old_loan_id: old_loan.id,
+        new_loan_id,
+        borrower: borrower.clone(),
+        old_amount: old_loan.amount,
+        new_amount,
+        old_rate_bps,
+        new_rate_bps: new_yield_bps,
+        refinanced_at: now,
+    };
+    env.storage()
+        .persistent()
+        .set(&DataKey::RefinanceRecord(new_loan_id), &refinance_record);
+
+    env.events().publish(
+        (symbol_short!("loan"), symbol_short!("refinance")),
+        (borrower, old_loan.id, new_loan_id, new_amount),
+    );
+
+    Ok(())
+}
+
+pub fn get_refinance_record(env: Env, loan_id: u64) -> Option<RefinanceRecord> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::RefinanceRecord(loan_id))
 }
 
 pub fn deposit_collateral(
@@ -1198,5 +1409,243 @@ pub fn disable_auto_repay(env: Env, borrower: Address) -> Result<(), ContractErr
     );
 
     Ok(())
+}
+
+// ── Issue #878: Loan Forbearance Period ──────────────────────────────────────
+
+pub fn request_forbearance(
+    env: Env,
+    borrower: Address,
+    duration_secs: Option<u64>,
+) -> Result<(), ContractError> {
+    borrower.require_auth();
+    require_not_paused(&env)?;
+
+    let mut loan = get_active_loan_record(&env, &borrower)?;
+
+    if loan.status != LoanStatus::Active {
+        return Err(ContractError::NoActiveLoan);
+    }
+
+    let existing: Option<ForbearanceRecord> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Forbearance(loan.id));
+    if let Some(ref fb) = existing {
+        if fb.status == ForbearanceStatus::Active {
+            return Err(ContractError::LoanInForbearance);
+        }
+    }
+
+    let period_number = existing
+        .map(|fb| fb.period_number)
+        .unwrap_or(0) + 1;
+
+    if period_number > MAX_FORBEARANCE_PERIODS {
+        return Err(ContractError::MaxForbearanceExceeded);
+    }
+
+    let now = env.ledger().timestamp();
+    let duration = duration_secs.unwrap_or(DEFAULT_FORBEARANCE_DURATION_SECS);
+    let ends_at = now + duration;
+
+    loan.deadline = loan.deadline + duration;
+    env.storage()
+        .persistent()
+        .set(&DataKey::Loan(loan.id), &loan);
+
+    let forbearance = ForbearanceRecord {
+        loan_id: loan.id,
+        borrower: borrower.clone(),
+        started_at: now,
+        duration_secs: duration,
+        ends_at,
+        original_deadline: loan.deadline - duration,
+        period_number,
+        status: ForbearanceStatus::Active,
+    };
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::Forbearance(loan.id), &forbearance);
+
+    env.events().publish(
+        (symbol_short!("loan"), symbol_short!("forbear")),
+        (borrower, loan.id, duration, ends_at),
+    );
+
+    Ok(())
+}
+
+pub fn end_forbearance(env: Env, borrower: Address) -> Result<(), ContractError> {
+    borrower.require_auth();
+    require_not_paused(&env)?;
+
+    let loan = get_active_loan_record(&env, &borrower)?;
+
+    let mut forbearance: ForbearanceRecord = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Forbearance(loan.id))
+        .ok_or(ContractError::ForbearanceNotFound)?;
+
+    if forbearance.status != ForbearanceStatus::Active {
+        return Err(ContractError::ForbearanceNotActive);
+    }
+
+    let now = env.ledger().timestamp();
+    if now >= forbearance.ends_at {
+        forbearance.status = ForbearanceStatus::Expired;
+    } else {
+        forbearance.status = ForbearanceStatus::Ended;
+    }
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::Forbearance(loan.id), &forbearance);
+
+    env.events().publish(
+        (symbol_short!("loan"), symbol_short!("forb_end")),
+        (borrower, loan.id),
+    );
+
+    Ok(())
+}
+
+pub fn get_forbearance(env: Env, loan_id: u64) -> Option<ForbearanceRecord> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Forbearance(loan_id))
+}
+
+pub fn is_in_forbearance(env: &Env, loan_id: u64) -> bool {
+    let fb: Option<ForbearanceRecord> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Forbearance(loan_id));
+    match fb {
+        Some(fb) => {
+            fb.status == ForbearanceStatus::Active
+                && env.ledger().timestamp() < fb.ends_at
+        }
+        None => false,
+    }
+}
+
+// ── Issue #881: Dynamic Interest Rate based on Risk Score ────────────────────
+
+pub fn get_dynamic_rate_config(env: &Env) -> DynamicRateConfig {
+    env.storage()
+        .instance()
+        .get(&DataKey::DynamicRateConfig)
+        .unwrap_or(DEFAULT_DYNAMIC_RATE_CONFIG)
+}
+
+pub fn set_dynamic_rate_config(
+    env: Env,
+    admin_signers: Vec<Address>,
+    config: DynamicRateConfig,
+) -> Result<(), ContractError> {
+    require_admin_approval(&env, &admin_signers);
+
+    if config.rate_floor_bps > config.rate_cap_bps {
+        return Err(ContractError::InvalidDynamicRateConfig);
+    }
+    if config.rate_cap_bps > 10_000 {
+        return Err(ContractError::InvalidDynamicRateConfig);
+    }
+
+    env.storage()
+        .instance()
+        .set(&DataKey::DynamicRateConfig, &config);
+
+    env.events().publish(
+        (symbol_short!("loan"), symbol_short!("dyn_cfg")),
+        (config.base_rate_bps, config.rate_cap_bps),
+    );
+
+    Ok(())
+}
+
+pub fn get_dynamic_rate_config_view(env: Env) -> DynamicRateConfig {
+    get_dynamic_rate_config(&env)
+}
+
+pub fn calculate_dynamic_rate(
+    env: &Env,
+    borrower: &Address,
+    risk_score: u32,
+) -> u32 {
+    let rate_cfg = get_dynamic_rate_config(env);
+
+    if !rate_cfg.enabled {
+        return rate_cfg.base_rate_bps;
+    }
+
+    let credit_tier_discount: u32 = match crate::credit_score::get_credit_score(
+        env.clone(),
+        borrower.clone(),
+    ) {
+        Some(cs) => {
+            let rewards = crate::credit_score::get_tier_rewards(env.clone(), cs.tier);
+            if rewards.yield_bonus_bps > 0 {
+                rewards.yield_bonus_bps as u32
+            } else {
+                0
+            }
+        }
+        None => 0,
+    };
+
+    let risk_adjustment = risk_score * rate_cfg.risk_adjustment_bps;
+    let raw_rate = rate_cfg
+        .base_rate_bps
+        .saturating_add(risk_adjustment)
+        .saturating_sub(credit_tier_discount);
+
+    raw_rate.max(rate_cfg.rate_floor_bps).min(rate_cfg.rate_cap_bps)
+}
+
+pub fn compute_and_store_dynamic_rate(
+    env: Env,
+    admin_signers: Vec<Address>,
+    borrower: Address,
+) -> Result<u32, ContractError> {
+    require_admin_approval(&env, &admin_signers);
+
+    let loan = get_active_loan_record(&env, &borrower)?;
+    let risk_score = loan.risk_score;
+
+    let effective_rate = calculate_dynamic_rate(&env, &borrower, risk_score);
+
+    let credit_tier = crate::credit_score::get_credit_score(env.clone(), borrower.clone())
+        .map(|cs| cs.tier)
+        .unwrap_or(crate::types::CreditTier::Fair);
+
+    let rate_record = BorrowerDynamicRate {
+        borrower: borrower.clone(),
+        loan_id: loan.id,
+        effective_rate_bps: effective_rate,
+        risk_score,
+        credit_tier,
+        computed_at: env.ledger().timestamp(),
+    };
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::BorrowerDynamicRate(borrower.clone()), &rate_record);
+
+    env.events().publish(
+        (symbol_short!("loan"), symbol_short!("dyn_rate")),
+        (borrower, loan.id, effective_rate, risk_score),
+    );
+
+    Ok(effective_rate)
+}
+
+pub fn get_borrower_dynamic_rate(env: Env, borrower: Address) -> Option<BorrowerDynamicRate> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::BorrowerDynamicRate(borrower))
 }
 
