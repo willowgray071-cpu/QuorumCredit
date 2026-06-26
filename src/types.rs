@@ -288,6 +288,23 @@ pub struct ThawState {
 /// Duration of the thaw period in seconds (24 hours).
 pub const THAW_DURATION_SECS: u64 = 24 * 60 * 60;
 
+// ── Governance Proposal Status ─────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProposalStatus {
+    /// Proposal is under active voting.
+    Active,
+    /// Proposal has passed and is executable.
+    Passed,
+    /// Proposal has been rejected.
+    Rejected,
+    /// Proposal voting period has expired.
+    Expired,
+    /// Proposal has been executed.
+    Executed,
+}
+
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -442,6 +459,30 @@ pub enum DataKey {
     SyndicationRepaymentCounter(u64), // syndication_id → counter
     /// Reputation NFT badge for excellent credit tier: borrower → ReputationNFTRecord
     ReputationNFTBadge(Address),
+    /// Issue #915: Audit trail hash for cryptographic immutability
+    AuditTrailHash,
+    /// Issue #915: Audit event count (monotonically increasing)
+    AuditEventCount,
+    /// Issue #919: Dependency audit log
+    DependencyAuditLog,
+    /// Issue #919: Dependency versions snapshot
+    DependencyVersions,
+    /// Issue #919: Dependency audit timestamp
+    DependencyAuditTimestamp,
+    /// Issue #920: Poison pill - disabled admin keys
+    AdminDisabled(Address),
+    /// Issue #920: Poison pill vote count per admin
+    PoisonPillVote(Address),
+    /// Issue #920: Poison pill recovery votes
+    PoisonPillRecoveryVotes(Address),
+    /// Issue #921: Governance proposal expiry timestamp
+    ProposalExpiry(u64),
+    /// Issue #921: Governance proposal status
+    ProposalStatus(u64),
+    /// Issue #921: Voting period configuration
+    VotingPeriod,
+    /// Issue #921: Maximum proposal duration
+    MaxProposalDuration,
 }
 
 // ── Governance ────────────────────────────────────────────────────────────────
