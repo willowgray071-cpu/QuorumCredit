@@ -8,6 +8,7 @@ pub mod cache;
 pub mod collateral_pool;
 pub mod credit_score;
 pub mod cross_chain;
+pub mod bridge_rate_oracle;
 pub mod errors;
 pub mod error_response;
 pub mod governance;
@@ -41,6 +42,7 @@ pub mod subordination;
 pub use errors::ContractError;
 pub use types::*;
 pub use cross_chain::{BridgeAttestation, BridgeAttestationPayload, CrossChainLoanMetadata, UnifiedReputation};
+pub use bridge_rate_oracle::RateSubmission;
 
 #[cfg(test)]
 mod slash_threshold_voting_test;
@@ -1835,6 +1837,61 @@ impl QuorumCreditContract {
 
     pub fn is_bridge_nonce_used(env: Env, origin_chain: u32, nonce: u64) -> bool {
         cross_chain::is_bridge_nonce_used(env, origin_chain, nonce)
+    }
+
+    // ── Issue #973 (#90): Decentralized bridge rate oracle ────────────────────
+
+    pub fn register_rate_oracle(
+        env: Env,
+        admin_signers: Vec<Address>,
+        operator: Address,
+    ) -> Result<(), ContractError> {
+        bridge_rate_oracle::register_rate_oracle(env, admin_signers, operator)
+    }
+
+    pub fn remove_rate_oracle(
+        env: Env,
+        admin_signers: Vec<Address>,
+        operator: Address,
+    ) -> Result<(), ContractError> {
+        bridge_rate_oracle::remove_rate_oracle(env, admin_signers, operator)
+    }
+
+    pub fn set_rate_quorum(
+        env: Env,
+        admin_signers: Vec<Address>,
+        quorum: u32,
+    ) -> Result<(), ContractError> {
+        bridge_rate_oracle::set_rate_quorum(env, admin_signers, quorum)
+    }
+
+    pub fn submit_bridge_rate(
+        env: Env,
+        operator: Address,
+        feed_id: u32,
+        rate: i128,
+    ) -> Result<(), ContractError> {
+        bridge_rate_oracle::submit_bridge_rate(env, operator, feed_id, rate)
+    }
+
+    pub fn get_bridge_rate(env: Env, feed_id: u32) -> Result<i128, ContractError> {
+        bridge_rate_oracle::get_bridge_rate(env, feed_id)
+    }
+
+    pub fn query_rate_submission(
+        env: Env,
+        feed_id: u32,
+        operator: Address,
+    ) -> Option<bridge_rate_oracle::RateSubmission> {
+        bridge_rate_oracle::query_rate_submission(env, feed_id, operator)
+    }
+
+    pub fn is_rate_oracle(env: Env, operator: Address) -> bool {
+        bridge_rate_oracle::is_rate_oracle(env, operator)
+    }
+
+    pub fn fresh_rate_submission_count(env: Env, feed_id: u32) -> u32 {
+        bridge_rate_oracle::fresh_submission_count(env, feed_id)
     }
 
     // ── Custom Attributes ────────────────────────────────────────────────────

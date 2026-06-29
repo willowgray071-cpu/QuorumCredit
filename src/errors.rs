@@ -174,4 +174,14 @@ MaxExtensionsReached = 139,
 LoanPrivacyRestricted = 140,
 /// Insurance pool is not connected to this loan.
 InsuranceNotLinked = 141,
+/// Caller is not a registered bridge rate oracle (#973/#90).
+RateOracleUnauthorized = 143,
+/// Not enough fresh oracle submissions to aggregate a decentralized rate.
+RateQuorumNotMet = 144,
+/// Submitted exchange rate is zero or negative.
+InvalidRateValue = 145,
+/// This address is already a registered rate oracle.
+RateOracleAlreadyRegistered = 146,
+/// This address is not a registered rate oracle.
+RateOracleNotFound = 147,
 }
