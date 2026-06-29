@@ -174,4 +174,10 @@ MaxExtensionsReached = 139,
 LoanPrivacyRestricted = 140,
 /// Insurance pool is not connected to this loan.
 InsuranceNotLinked = 141,
+/// The specified chain ID is not registered or not active.
+InvalidChain = 143,
+/// A bridge for this chain ID is already registered.
+BridgeAlreadyRegistered = 144,
+/// Voucher has not been bridge-validated for this chain.
+BridgeNotValidated = 145,
 }

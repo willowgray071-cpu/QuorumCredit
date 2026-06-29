@@ -5,7 +5,8 @@
 //! transaction that stores the mirrored loan and unified reputation.
 
 use crate::{helpers, ContractError, PaymentRecord};
-use soroban_sdk::{contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, Vec};
+use crate::types::{BridgeRecord, DataKey};
+use soroban_sdk::{contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, String, Vec};
 
 /// Attestation freshness window. Old attestations are rejected even when signed.
 pub const MAX_ATTESTATION_AGE_SECS: u64 = 60 * 60;
@@ -62,6 +63,65 @@ enum CrossChainKey {
     LoanSettlement(u32, u64),
     Reputation(Address),
     ReputationVersion(Address),
+}
+
+/// Register a new cross-chain bridge. Requires admin approval.
+/// Fails with `BridgeAlreadyRegistered` if a bridge for `chain_id` already exists.
+pub fn register_bridge(
+    env: Env,
+    admin_signers: Vec<Address>,
+    chain_id: u32,
+    chain_name: String,
+    bridge_address: Address,
+) -> Result<(), ContractError> {
+    helpers::require_admin_approval(&env, &admin_signers);
+    if env.storage().persistent().has(&DataKey::Bridge(chain_id)) {
+        return Err(ContractError::BridgeAlreadyRegistered);
+    }
+    let record = BridgeRecord { chain_id, chain_name, bridge_address, active: true };
+    env.storage().persistent().set(&DataKey::Bridge(chain_id), &record);
+    let mut list: Vec<u32> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::BridgeList)
+        .unwrap_or(Vec::new(&env));
+    list.push_back(chain_id);
+    env.storage().persistent().set(&DataKey::BridgeList, &list);
+    Ok(())
+}
+
+/// Deactivate a registered bridge (sets `active = false`).
+/// Future cross-chain vouches for this chain will be rejected.
+pub fn remove_bridge(
+    env: Env,
+    admin_signers: Vec<Address>,
+    chain_id: u32,
+) -> Result<(), ContractError> {
+    helpers::require_admin_approval(&env, &admin_signers);
+    let mut record: BridgeRecord = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Bridge(chain_id))
+        .ok_or(ContractError::InvalidChain)?;
+    record.active = false;
+    env.storage().persistent().set(&DataKey::Bridge(chain_id), &record);
+    Ok(())
+}
+
+/// Return all registered bridge records.
+pub fn get_bridges(env: Env) -> Vec<BridgeRecord> {
+    let list: Vec<u32> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::BridgeList)
+        .unwrap_or(Vec::new(&env));
+    let mut result: Vec<BridgeRecord> = Vec::new(&env);
+    for id in list.iter() {
+        if let Some(r) = env.storage().persistent().get::<DataKey, BridgeRecord>(&DataKey::Bridge(id)) {
+            result.push_back(r);
+        }
+    }
+    result
 }
 
 /// Configure or rotate an origin chain's Stellar bridge verification key.

@@ -12,16 +12,17 @@ use crate::types::{
 use soroban_sdk::{symbol_short, token, Address, Env, Vec};
 use soroban_sdk::BytesN;
 
-/// Verify that `token` is accepted by the registered bridge for `chain_id`.
-/// Returns an error if no active bridge record exists for this chain.
-fn validate_bridge(env: &Env, chain_id: u32, _token: &Address) -> Result<(), ContractError> {
-    // Look for an active BridgeRecord for this chain_id via linear scan of known bridge IDs.
-    // If no bridge is configured, reject the cross-chain vouch.
-    let _ = chain_id;
-    let _ = env;
-    // Bridges are registered via admin actions; cross-chain vouches require validation.
-    // Currently we rely on the BridgeValidated per-voucher check in vouch_with_chain.
-    Ok(())
+/// Verify that an active bridge is registered for `chain_id`.
+/// Returns `InvalidChain` if no active bridge record exists for this chain.
+fn validate_bridge(env: &Env, chain_id: u32) -> Result<(), ContractError> {
+    let record: Option<crate::types::BridgeRecord> = env
+        .storage()
+        .persistent()
+        .get(&crate::types::DataKey::Bridge(chain_id));
+    match record {
+        Some(r) if r.active => Ok(()),
+        _ => Err(ContractError::InvalidChain),
+    }
 }
 
 struct VouchConfig {
@@ -66,7 +67,7 @@ pub fn vouch(
     token: Address,
     chain_id: Option<u32>,
 ) -> Result<(), ContractError> {
-    vouch_with_chain(env, voucher, borrower, stake, token, 0)
+    vouch_with_chain(env, voucher, borrower, stake, token, chain_id)
 }
 
 /// Vouch with cross-chain support. chain_id=0 means native Stellar.
@@ -79,7 +80,7 @@ pub fn vouch_cross_chain(
     token: Address,
     chain_id: u32,
 ) -> Result<(), ContractError> {
-    vouch_with_chain(env, voucher, borrower, stake, token, chain_id)
+    vouch_with_chain(env, voucher, borrower, stake, token, Some(chain_id))
 }
 
 fn vouch_with_chain(
@@ -88,25 +89,18 @@ fn vouch_with_chain(
     borrower: Address,
     stake: i128,
     token: Address,
-    chain_id: u32,
+    chain_id: Option<u32>,
 ) -> Result<(), ContractError> {
     voucher.require_auth();
     require_not_thawing(&env)?;
 
-    // Bridge validation: non-native chain vouches require prior bridge validation
-    if chain_id != 0 {
-        let validated: bool = env
-            .storage()
-            .persistent()
-            .get(&DataKey::BridgeValidated(voucher.clone(), chain_id))
-            .unwrap_or(false);
-        if !validated {
-            return Err(ContractError::BridgeNotValidated);
-        }
+    // Bridge validation: non-native chain vouches require an active registered bridge
+    if let Some(cid) = chain_id {
+        validate_bridge(&env, cid)?;
     }
 
     let cfg = VouchConfig::load(&env);
-    do_vouch(&env, &cfg, voucher, borrower, stake, token, Some(chain_id))
+    do_vouch(&env, &cfg, voucher, borrower, stake, token, chain_id)
 }
 
 fn validate_vouch<'a>(
@@ -146,10 +140,9 @@ fn validate_vouch<'a>(
 
     let token_client = require_allowed_token(env, token)?;
 
-    // Bridge validation: if chain_id is provided, the token must originate from
-    // a registered, active bridge for that chain.
+    // Bridge validation: if chain_id is provided, check against registered bridge registry
     if let Some(cid) = chain_id {
-        validate_bridge(env, cid, token)?;
+        validate_bridge(env, cid)?;
     }
 
     if cfg.min_stake > 0 && stake < cfg.min_stake {

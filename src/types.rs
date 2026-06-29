@@ -434,6 +434,10 @@ pub enum DataKey {
     VoucherInsurance(Address, Address),
     /// Cross-chain bridge validation status: (voucher, chain_id) → bool.
     BridgeValidated(Address, u32),
+    /// List of all registered chain IDs: Vec<u32>
+    BridgeList,
+    /// Bridge record per chain ID: u32 → BridgeRecord
+    Bridge(u32),
     /// Issue #687: admin removal proposal id → AdminRemovalProposal
     AdminRemovalProposal(u64),
     /// Issue #687: monotonically increasing admin removal proposal counter
