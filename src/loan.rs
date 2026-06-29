@@ -9,6 +9,7 @@ use crate::types::{
     BorrowerDynamicRate, DataKey, DynamicRateConfig, EscrowStatus,
     ForbearanceRecord, ForbearanceStatus, LoanRecord, LoanStatus,
     RefinanceRecord, SlashRecord, VouchRecord, VoucherStats,
+    YieldDistributionEntry,
     BPS_DENOMINATOR, DEFAULT_DYNAMIC_RATE_CONFIG, DEFAULT_FORBEARANCE_DURATION_SECS,
     MAX_FORBEARANCE_PERIODS, REPUTATION_BONUS_MAX_BPS, SLASH_ESCROW_PERIOD,
 };
@@ -236,6 +237,9 @@ pub fn request_loan(
         maturity_date: None,
         rate_type: crate::types::RateType::Fixed,
         index_reference: None,
+        last_interest_calc: now,
+        accrued_interest: 0,
+        milestone_bonus_applied: false,
         retry_count: 0,
     };
 
@@ -327,7 +331,7 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
              let l = get_latest_loan_record(&env, &borrower).ok_or(ContractError::NoActiveLoan)?;
              if l.status != LoanStatus::Defaulted {
                  env.events().publish(
-                     (symbol_short!("loan"), symbol_short!("repayment_failure")),
+                     (symbol_short!("loan"), symbol_short!("repay_err")),
                      (borrower.clone(), payment),
                  );
                  return Err(ContractError::NoActiveLoan);
@@ -336,7 +340,7 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
          }
          Err(e) => {
              env.events().publish(
-                 (symbol_short!("loan"), symbol_short!("repayment_failure")),
+                 (symbol_short!("loan"), symbol_short!("repay_err")),
                  (borrower.clone(), payment),
              );
              return Err(e);
@@ -1182,7 +1186,7 @@ pub fn set_buyback_price(
         .set(&DataKey::Loan(loan.id), &loan);
 
     env.events().publish(
-        (symbol_short!("loan"), symbol_short!("buyback_set")),
+        (symbol_short!("loan"), symbol_short!("bkset")),
         (borrower, price),
     );
 
@@ -1255,7 +1259,7 @@ pub fn enable_auto_repay(env: Env, borrower: Address) -> Result<(), ContractErro
         .set(&DataKey::Loan(loan.id), &loan);
 
     env.events().publish(
-        (symbol_short!("loan"), symbol_short!("auto_repay_on")),
+        (symbol_short!("loan"), symbol_short!("arpay_on")),
         borrower,
     );
 
@@ -1416,7 +1420,7 @@ pub fn disable_auto_repay(env: Env, borrower: Address) -> Result<(), ContractErr
         .set(&DataKey::Loan(loan.id), &loan);
 
     env.events().publish(
-        (symbol_short!("loan"), symbol_short!("auto_repay_off")),
+        (symbol_short!("loan"), symbol_short!("arpay_off")),
         borrower,
     );
 

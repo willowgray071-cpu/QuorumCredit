@@ -174,4 +174,46 @@ MaxExtensionsReached = 139,
 LoanPrivacyRestricted = 140,
 /// Insurance pool is not connected to this loan.
 InsuranceNotLinked = 141,
+    /// Admin is not in the whitelist.
+    AdminNotWhitelisted = 143,
+    /// Admin is in the blacklist.
+    AdminBlacklisted = 144,
+    /// Governance proposal has already been approved.
+    AlreadyApproved = 145,
+    /// Loan has already been repaid.
+    AlreadyRepaid = 146,
+    /// Custom attribute not found.
+    AttributeNotFound = 147,
+    /// Bridge attestation has not been validated.
+    BridgeNotValidated = 148,
+    /// Circular voucher delegation is not allowed.
+    CircularDelegation = 149,
+    /// Co-borrower has already been added.
+    CoBorrowerAlreadyAdded = 150,
+    /// Forbearance period is not active.
+    ForbearanceNotActive = 151,
+    /// No forbearance record found.
+    ForbearanceNotFound = 152,
+    /// Dynamic rate configuration is invalid.
+    InvalidDynamicRateConfig = 153,
+    /// Operation is not valid in the current state.
+    InvalidOperation = 154,
+    /// Loan amount exceeds the maximum allowed.
+    LoanAboveMaxAmount = 155,
+    /// Loan is currently in a forbearance period.
+    LoanInForbearance = 156,
+    /// Loan not found.
+    LoanNotFound = 157,
+    /// Maximum number of co-borrowers has been exceeded.
+    MaxCoBorrowersExceeded = 158,
+    /// Maximum number of forbearance periods has been exceeded.
+    MaxForbearanceExceeded = 159,
+    /// Reentrancy was detected.
+    Reentrancy = 160,
+    /// Cannot refinance a loan with no outstanding balance.
+    RefinanceNoOutstanding = 161,
+    /// Self co-borrower is not allowed.
+    SelfCoBorrowerNotAllowed = 162,
+    /// Caller is not authorized.
+    Unauthorized = 163,
 }

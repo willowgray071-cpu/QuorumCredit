@@ -4,11 +4,14 @@ use crate::helpers::{
     require_admin_approval, require_governance_participant, require_not_paused,
 };
 use crate::types::{
-    AppealStatus, DataKey, LoanStatus, PendingSlashRecord, SlashEscrowAppealRecord, SlashEscrow,
-    SlashRecord, SlashThresholdProposal, SlashVoteRecord, TimelockAction, TimelockProposal,
-    VouchRecord, BPS_DENOMINATOR, APPEAL_OVERRIDE_QUORUM_BPS, SLASH_APPEAL_PERIOD,
+    AdminRemovalProposal, AppealStatus, DataKey, LoanStatus, PendingSlashRecord,
+    SlashAppealRecord, SlashEscrowAppealRecord, SlashEscrow,
+    SlashingReportRecord, SlashRecord, SlashThresholdProposal, SlashVoteRecord,
+    TimelockAction, TimelockProposal,
+    VouchRecord, BPS_DENOMINATOR, APPEAL_OVERRIDE_QUORUM_BPS, MONTHLY_PERIOD_SECS,
+    SLASH_APPEAL_PERIOD,
 };
-use soroban_sdk::{panic_with_error, symbol_short, Address, Env, Vec};
+use soroban_sdk::{panic_with_error, symbol_short, Address, Env, String, Vec};
 
 /// Default quorum: 50% of total vouched stake must approve.
 const DEFAULT_SLASH_VOTE_QUORUM_BPS: u32 = 5_000;
@@ -512,7 +515,7 @@ fn execute_slash(env: &Env, borrower: &Address) -> Result<(), ContractError> {
 /// Queue a slash operation for deferred batch execution (Issue #937: Lazy Slash).
 /// This allows multiple slashes to be batched together, reducing gas costs.
 pub fn queue_slash(env: Env, borrower: Address, slash_amount: i128) -> Result<(), ContractError> {
-    require_admin_approval(env.clone(), &env.current_contract_address(), &vec![env.current_contract_address()])?;
+    require_admin_approval(&env, &Vec::new(&env));
     
     // Calculate slash amount from existing vouch stake if not provided
     let actual_slash = if slash_amount > 0 {
@@ -532,7 +535,7 @@ pub fn queue_slash(env: Env, borrower: Address, slash_amount: i128) -> Result<()
     crate::lazy_slash::queue_slash(&env, borrower.clone(), actual_slash)?;
     
     env.events().publish(
-        (symbol_short!("gov"), symbol_short!("slash_queued")),
+        (symbol_short!("gov"), symbol_short!("slashqd")),
         (borrower.clone(), actual_slash),
     );
     
@@ -542,12 +545,12 @@ pub fn queue_slash(env: Env, borrower: Address, slash_amount: i128) -> Result<()
 /// Execute all queued slash operations in a single batch (Issue #937: Lazy Slash).
 /// Returns the number of slashes executed.
 pub fn execute_queued_slashes(env: Env) -> Result<u32, ContractError> {
-    require_admin_approval(env.clone(), &env.current_contract_address(), &vec![env.current_contract_address()])?;
+    require_admin_approval(&env, &Vec::new(&env));
     
     let executed = crate::lazy_slash::execute_queued_slashes(&env)?;
     
     env.events().publish(
-        (symbol_short!("gov"), symbol_short!("slash_queue_executed")),
+        (symbol_short!("gov"), symbol_short!("slashqexc")),
         (executed,),
     );
     
@@ -1349,7 +1352,7 @@ pub fn vote_appeal(
         .ok_or(ContractError::AppealNotFound)?;
 
     // Prevent double voting
-    if appeal.voters.iter().any(|v| v == &voucher) {
+    if appeal.voters.iter().any(|v| v == voucher) {
         return Err(ContractError::AppealAlreadyVoted);
     }
 
@@ -1806,7 +1809,7 @@ pub fn initiate_cross_chain_sync(
     source_chain: String,
     target_chains: Vec<String>,
     proposal_type: String,
-    proposal_data: Vec<u8>,
+    proposal_data: soroban_sdk::Bytes,
 ) -> Result<u64, ContractError> {
     proposer.require_auth();
     require_not_paused(&env)?;

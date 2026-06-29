@@ -4,7 +4,7 @@ use crate::types::{
     DataKey, LoanSyndication, SyndicationConfig, SyndicationMember, SyndicationRepayment,
     SyndicationRole, SyndicationStatus, DEFAULT_SYNDICATION_CONFIG,
 };
-use soroban_sdk::{panic_with_error, Address, Env, Vec};
+use soroban_sdk::{panic_with_error, symbol_short, Address, Env, Vec};
 
 /// Get the syndication configuration, or default if not set.
 fn get_syndication_config(env: &Env) -> SyndicationConfig {
@@ -73,7 +73,7 @@ pub fn create_syndication(
         .set(&DataKey::LoanSyndication(syndication_id), &syndication);
 
     env.events().publish(
-        (symbol_short!("syndication"), symbol_short!("created")),
+        (symbol_short!("syndictn"), symbol_short!("created")),
         (syndication_id, creator, total_amount),
     );
 
@@ -121,7 +121,7 @@ pub fn join_syndication(
     }
 
     // Check max members
-    if syndication.members.len() >= cfg.max_members as usize {
+    if syndication.members.len() >= cfg.max_members {
         return Err(ContractError::SyndicationMaxMembersExceeded);
     }
 
@@ -163,7 +163,7 @@ pub fn join_syndication(
         .set(&DataKey::LoanSyndication(syndication_id), &syndication);
 
     env.events().publish(
-        (symbol_short!("syndication"), symbol_short!("joined")),
+        (symbol_short!("syndictn"), symbol_short!("joined")),
         (syndication_id, member, role),
     );
 
@@ -230,7 +230,7 @@ pub fn approve_syndication(
         .set(&DataKey::LoanSyndication(syndication_id), &syndication);
 
     env.events().publish(
-        (symbol_short!("syndication"), symbol_short!("approved")),
+        (symbol_short!("syndictn"), symbol_short!("approved")),
         (syndication_id, member, syndication.approval_count),
     );
 
@@ -293,7 +293,7 @@ pub fn leave_syndication(
     syndication.members.remove(member_index);
 
     // Check min members
-    if syndication.members.len() < cfg.min_members as usize {
+    if syndication.members.len() < cfg.min_members {
         syndication.status = SyndicationStatus::Cancelled;
     }
 
@@ -303,7 +303,7 @@ pub fn leave_syndication(
         .set(&DataKey::LoanSyndication(syndication_id), &syndication);
 
     env.events().publish(
-        (symbol_short!("syndication"), symbol_short!("left")),
+        (symbol_short!("syndictn"), symbol_short!("left")),
         (syndication_id, member),
     );
 
@@ -348,7 +348,7 @@ pub fn cancel_syndication(
         .set(&DataKey::LoanSyndication(syndication_id), &syndication);
 
     env.events().publish(
-        (symbol_short!("syndication"), symbol_short!("cancelled")),
+        (symbol_short!("syndictn"), symbol_short!("cancelled")),
         (syndication_id, caller),
     );
 
@@ -402,7 +402,7 @@ pub fn set_syndication_config(
         .set(&DataKey::SyndicationConfig, &config);
 
     env.events().publish(
-        (symbol_short!("syndication"), symbol_short!("config")),
+        (symbol_short!("syndictn"), symbol_short!("config")),
         admin_signers.get(0),
     );
 
@@ -462,7 +462,7 @@ pub fn request_syndication_loan(
     }
 
     // Check contract balance
-    let token_client = crate::helpers::token(&env);
+    let token_client = crate::helpers::primary_token(&env);
     let contract_balance = token_client.balance(&env.current_contract_address());
     if contract_balance < syndication.total_amount {
         return Err(ContractError::InsufficientFunds);
@@ -476,12 +476,15 @@ pub fn request_syndication_loan(
     let loan_record = crate::types::LoanRecord {
         id: loan_id,
         borrower: lead_borrower.clone(),
-        co_borrowers: syndication
-            .members
-            .iter()
-            .filter(|m| m.role == SyndicationRole::CoBorrower)
-            .map(|m| m.address.clone())
-            .collect(),
+        co_borrowers: {
+            let mut co = Vec::new(&env);
+            for m in syndication.members.iter() {
+                if m.role == SyndicationRole::CoBorrower {
+                    co.push_back(m.address.clone());
+                }
+            }
+            co
+        },
         guarantor: syndication
             .members
             .iter()
@@ -508,6 +511,9 @@ pub fn request_syndication_loan(
         maturity_date: None,
         rate_type: crate::types::RateType::Fixed,
         index_reference: None,
+        last_interest_calc: now,
+        accrued_interest: 0,
+        milestone_bonus_applied: false,
         retry_count: 0,
     };
 
@@ -540,7 +546,7 @@ pub fn request_syndication_loan(
 
     // Publish events
     env.events().publish(
-        (symbol_short!("syndication"), symbol_short!("loan_disbursed")),
+        (symbol_short!("syndictn"), symbol_short!("disbursed")),
         (syndication_id, loan_id, syndication.total_amount),
     );
 
@@ -589,7 +595,7 @@ pub fn repay_syndication_loan(
     let repayment_amount = amount.min(outstanding);
 
     // Transfer repayment
-    let token_client = crate::helpers::token(&env);
+    let token_client = crate::helpers::primary_token(&env);
     token_client.transfer(&repayer, &env.current_contract_address(), &repayment_amount);
 
     // Update loan
@@ -653,7 +659,7 @@ pub fn repay_syndication_loan(
 
     // Publish events
     env.events().publish(
-        (symbol_short!("syndication"), symbol_short!("repayment")),
+        (symbol_short!("syndictn"), symbol_short!("repayment")),
         (syndication_id, repayer, repayment_amount),
     );
 
@@ -703,7 +709,7 @@ pub fn handle_syndication_default(
     loan.status = crate::types::LoanStatus::Defaulted;
 
     // Slash collateral from all members
-    let token_client = crate::helpers::token(&env);
+    let token_client = crate::helpers::primary_token(&env);
     let slash_treasury = env.storage().instance().get(&DataKey::SlashTreasury).unwrap_or(0);
 
     for member in syndication.members.iter() {
@@ -748,7 +754,7 @@ pub fn handle_syndication_default(
 
     // Publish events
     env.events().publish(
-        (symbol_short!("syndication"), symbol_short!("defaulted")),
+        (symbol_short!("syndictn"), symbol_short!("defaulted")),
         (syndication_id, loan_id, syndication.total_collateral),
     );
 

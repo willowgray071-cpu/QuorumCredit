@@ -15,7 +15,7 @@
 //! to XLM. When accepting user input in XLM, multiply by `10_000_000`
 //! before passing to contract functions.
 
-use soroban_sdk::{contracttype, Address, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, String, Vec};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -511,6 +511,99 @@ pub enum DataKey {
     CascadingDefaultRecord(u64),
     /// Waterfall distribution configuration for a borrower
     WaterfallConfig(Address),
+    // ── Issue #934: Yield Calculation Caching ──────────────────────────────────
+    /// (borrower, voucher) → CachedYieldRecord
+    YieldCache(Address, Address),
+    // ── Cache infrastructure (Issue #724) ──────────────────────────────────────
+    /// LRU index counter for cache eviction
+    LruIndex,
+    /// Oldest loan cache entry ID for LRU eviction
+    LruOldestLoanId,
+    // ── Reentrancy Guard ──────────────────────────────────────────────────────
+    /// bool: true when a state-mutating operation is in progress
+    Locked,
+    // ── Nonce tracking (Issue #64) ────────────────────────────────────────────
+    /// Address → u64: last consumed nonce for replay protection
+    Nonce(Address),
+    // ── Oracle price (Issue #64) ──────────────────────────────────────────────
+    /// Symbol → OraclePriceRecord
+    OraclePrice(soroban_sdk::Symbol),
+    // ── Graduated threat level (Issue #65) ────────────────────────────────────
+    /// ThreatLevel enum value
+    ThreatLevelKey,
+    // ── Multi-tier admin thresholds (Issue #893) ──────────────────────────────
+    /// MultiTierAdminThresholds configuration (stored in instance storage)
+    MultiTierAdminThresholds,
+    // ── Risk threshold governance (Issue #903) ────────────────────────────────
+    /// proposal_id → RiskThresholdProposal
+    RiskThresholdProposal(u64),
+    /// monotonically increasing risk threshold proposal counter
+    RiskThresholdCounter,
+    /// (proposal_id, voter) → bool (has voted)
+    RiskThresholdVote(u64, Address),
+    // ── Fee structure governance (Issue #904) ─────────────────────────────────
+    /// proposal_id → FeeStructureProposal
+    FeeStructureProposal(u64),
+    /// monotonically increasing fee structure proposal counter
+    FeeStructureCounter,
+    /// (proposal_id, voter) → bool (has voted)
+    FeeStructureVote(u64, Address),
+    // ── Withdrawal timelock (Issue #905) ──────────────────────────────────────
+    /// (borrower, voucher) → withdrawal timelock record
+    WithdrawalTimelock(u64),
+    /// monotonically increasing withdrawal timelock counter
+    WithdrawalTimelockCounter,
+    // ── Cross-chain proposal sync (Issue #906) ─────────────────────────────────
+    /// proposal_id → CrossChainProposalSync
+    CrossChainProposalSync(u64),
+    /// monotonically increasing cross-chain proposal sync counter
+    CrossChainSyncCounter,
+    // ── Yield stream (Issue #907) ──────────────────────────────────────────────
+    /// loan_id → YieldStreamState
+    YieldStreamState(u64),
+    /// (loan_id, voucher) → VoucherYieldClaim
+    VoucherYieldClaim(u64, Address),
+    // ── Periodic payments (Issue #908) ────────────────────────────────────────
+    /// loan_id → PeriodicPaymentConfig
+    PeriodicPaymentConfig(u64),
+    /// loan_id → PeriodicPaymentStatus
+    PeriodicPaymentStatus(u64),
+    // ── Vouch groups (Issue #909) ──────────────────────────────────────────────
+    /// group_id → VouchGroup
+    VouchGroup(u64),
+    /// monotonically increasing vouch group counter
+    VouchGroupCounter,
+    /// voucher → Vec<u64> group IDs the voucher belongs to
+    VoucherGroupIds(Address),
+    // ── Vouch merkle root (Issue #910) ────────────────────────────────────────
+    /// borrower → BytesN<32> merkle root of vouch set
+    VouchMerkleRoot(Address),
+    // ── Batch transfers (Issue #935) ──────────────────────────────────────────
+    /// Vec<BatchTransfer> pending transfer queue
+    PendingTransfers,
+    // ── Lazy slash queue (Issue #937) ─────────────────────────────────────────
+    /// Vec<LazySlashEntry> queued slash operations
+    LazySlashQueue,
+    // ── Custom attributes ────────────────────────────────────────────────────
+    /// Address → Vec<AttributeEntry>
+    CustomAttributes(Address),
+    // ── Forbearance (Issue #878) ──────────────────────────────────────────────
+    /// loan_id → ForbearanceRecord
+    Forbearance(u64),
+    // ── Refinance record (Issue #877) ─────────────────────────────────────────
+    /// loan_id → RefinanceRecord
+    RefinanceRecord(u64),
+    // ── Dynamic rate (Issue #881) ──────────────────────────────────────────────
+    /// DynamicRateConfig (global config)
+    DynamicRateConfig,
+    /// borrower → BorrowerDynamicRate
+    BorrowerDynamicRate(Address),
+    // ── API versioning ─────────────────────────────────────────────────────────
+    /// Current API version string
+    ApiVersion,
+    // ── Repayment confirmation ─────────────────────────────────────────────────
+    /// loan_id → bool (repayment confirmed by oracle)
+    RepaymentConfirmation(u64),
 }
 
 /// Issue #867: Shared collateral pool backed by multiple vouchers.
@@ -1156,6 +1249,22 @@ pub struct Config {
     /// Issue #893: Multi-tier admin approval thresholds for different operation types.
     /// If not set, falls back to single admin_threshold for all operations.
     pub multi_tier_thresholds: Option<MultiTierAdminThresholds>,
+    /// Recovery percentage for defaulted loans (in basis points, e.g. 5000 = 50%).
+    pub recovery_percentage: u32,
+    /// When true, the slash threshold is calculated dynamically based on pool health.
+    pub dynamic_slash_threshold: bool,
+    /// When true, loan size affects the maximum slash basis points.
+    pub loan_size_slash_enabled: bool,
+    /// Maximum slash in basis points when loan size slash is enabled (e.g. 8000 = 80%).
+    pub loan_size_slash_max_bps: i128,
+    /// When true, loans require admin confirmation before being executed.
+    pub confirmation_required: bool,
+    /// Admin compensation rate in basis points (e.g. 100 = 1%).
+    pub admin_compensation_bps: u32,
+    /// Minimum votes required to remove an admin via governance (0 = disabled).
+    pub removal_vote_threshold: u32,
+    /// Insurance premium rate in basis points collected at loan disbursement (e.g. 100 = 1%).
+    pub insurance_premium_bps: u32,
 }
 
 // ── Data Types ────────────────────────────────────────────────────────────────
@@ -1476,6 +1585,25 @@ pub struct VoucherStats {
     pub total_slashed: i128,
 }
 
+/// Maximum number of loan entries to keep in the LRU cache.
+pub const CACHE_LRU_MAX_ENTRIES: u32 = 100;
+/// TTL for general cached records, in seconds (5 minutes).
+pub const CACHE_TTL_SECS: u64 = 5 * 60;
+/// TTL for cached yield-bps values, in seconds (5 minutes).
+pub const YIELD_CACHE_TTL_SECS: u64 = 5 * 60;
+
+/// Cached per-vouch yield rate for a (borrower, voucher) pair.
+#[contracttype]
+#[derive(Clone)]
+pub struct CachedYieldRecord {
+    /// The cached yield rate in basis points.
+    pub yield_bps: i128,
+    /// Ledger timestamp when this value was cached.
+    pub cached_at: u64,
+    /// The base yield_bps from config at cache time (for stale-config detection).
+    pub base_yield_bps: i128,
+}
+
 /// Current API version of the contract.
 pub const API_VERSION: u32 = 1;
 
@@ -1660,7 +1788,7 @@ pub struct CrossChainProposalSync {
     pub source_chain: String,
     pub target_chains: Vec<String>,
     pub proposal_type: String,  // "risk", "fee", "timelock"
-    pub proposal_data: Vec<u8>,
+    pub proposal_data: soroban_sdk::Bytes,
     pub votes_required: u32,
     pub votes_received: u32,
     pub status: GovernanceProposalStatus,
@@ -1802,3 +1930,251 @@ pub struct WaterfallDistribution {
 /// `CascadingDefaultRecord(u64)` => senior_loan_id -> CascadingDefault
 pub const MAX_SUBORDINATION_DEPTH: u32 = 10; // Prevent deeply nested hierarchies
 pub const MAX_SUBORDINATES_PER_LOAN: u32 = 50; // Prevent excessive branching
+
+// ── Issue #934: Yield Calculation Caching ────────────────────────────────────
+
+// ── Issue #907: Yield Streaming ───────────────────────────────────────────────
+
+/// Per-loan yield stream state, tracking how much yield has been claimed so far.
+#[contracttype]
+#[derive(Clone)]
+pub struct YieldStreamState {
+    pub loan_id: u64,
+    pub last_claim_timestamp: u64,
+    pub total_yield_claimed: i128,
+}
+
+/// Per-voucher yield claim record for a specific loan.
+#[contracttype]
+#[derive(Clone)]
+pub struct VoucherYieldClaim {
+    pub voucher: Address,
+    pub loan_id: u64,
+    pub last_claim_timestamp: u64,
+    pub yield_claimed: i128,
+}
+
+// ── Issue #908: Periodic Payments ─────────────────────────────────────────────
+
+/// Schedule type for periodic payments.
+#[contracttype]
+#[derive(Clone, PartialEq)]
+pub enum ScheduleType {
+    Weekly,
+    BiWeekly,
+    Monthly,
+    Quarterly,
+}
+
+/// Configuration for a periodic payment schedule on a loan.
+#[contracttype]
+#[derive(Clone)]
+pub struct PeriodicPaymentConfig {
+    pub schedule_type: ScheduleType,
+    pub period_count: u32,
+    pub period_interest_bps: u32,
+    pub periods_completed: u32,
+    pub enabled: bool,
+}
+
+/// Runtime status of a periodic payment schedule.
+#[contracttype]
+#[derive(Clone)]
+pub struct PeriodicPaymentStatus {
+    pub loan_id: u64,
+    pub config: PeriodicPaymentConfig,
+    pub next_period_due: u64,
+    pub last_payment_timestamp: u64,
+    pub total_period_interest_paid: i128,
+}
+
+// ── Issue #909: Vouch Groups ───────────────────────────────────────────────────
+
+/// A named group of vouchers for coordinated vouching.
+#[contracttype]
+#[derive(Clone)]
+pub struct VouchGroup {
+    pub group_id: u64,
+    pub name: String,
+    pub vouchers: Vec<Address>,
+    pub created_at: u64,
+}
+
+// ── Custom Attributes ─────────────────────────────────────────────────────────
+
+/// A single key-value attribute entry for custom metadata.
+#[contracttype]
+#[derive(Clone)]
+pub struct AttributeEntry {
+    pub key: String,
+    pub value: String,
+}
+
+// ── Issue #935: Batch Transfers ───────────────────────────────────────────────
+
+/// A pending token transfer to be executed in a batch.
+#[contracttype]
+#[derive(Clone)]
+pub struct BatchTransfer {
+    pub to: Address,
+    pub amount: i128,
+    pub token: Address,
+}
+
+// ── Issue #937: Lazy Slash Queue ──────────────────────────────────────────────
+
+/// A queued slash entry for lazy (batched) execution.
+#[contracttype]
+#[derive(Clone)]
+pub struct LazySlashEntry {
+    pub borrower: Address,
+    pub slash_amount: i128,
+    pub queued_at: u64,
+}
+
+// ── Issue #64: Oracle Price Staleness ─────────────────────────────────────────
+
+/// Staleness window for oracle price records, in seconds (1 hour).
+pub const ORACLE_PRICE_MAX_AGE_SECS: u64 = 60 * 60;
+
+/// An oracle price record with a value and timestamp.
+#[contracttype]
+#[derive(Clone)]
+pub struct OraclePriceRecord {
+    pub price: i128,
+    pub recorded_at: u64,
+}
+
+// ── Issue #65: Graduated Response / Tiered Lockdown ──────────────────────────
+
+/// Protocol threat level for graduated response.
+#[contracttype]
+#[derive(Clone, PartialEq)]
+pub enum ThreatLevel {
+    Normal,
+    Elevated,
+    Critical,
+    Lockdown,
+}
+
+// ── Issue #552 / #841: Slash Appeal ───────────────────────────────────────────
+
+/// A slash appeal record submitted by a voucher on behalf of a defaulted borrower.
+#[contracttype]
+#[derive(Clone)]
+pub struct SlashAppealRecord {
+    pub borrower: Address,
+    pub voucher: Address,
+    pub evidence_hash: BytesN<32>,
+    pub appeal_timestamp: u64,
+    pub approved: Option<bool>,
+    pub admin_votes: Vec<Address>,
+}
+
+// ── Issue #878: Loan Forbearance ──────────────────────────────────────────────
+
+/// Maximum number of forbearance periods per loan.
+pub const MAX_FORBEARANCE_PERIODS: u32 = 3;
+
+/// Default forbearance duration in seconds (30 days).
+pub const DEFAULT_FORBEARANCE_DURATION_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Status of a forbearance period.
+#[contracttype]
+#[derive(Clone, PartialEq)]
+pub enum ForbearanceStatus {
+    Active,
+    Expired,
+    Ended,
+}
+
+/// A forbearance record for a specific loan.
+#[contracttype]
+#[derive(Clone)]
+pub struct ForbearanceRecord {
+    pub loan_id: u64,
+    pub borrower: Address,
+    pub started_at: u64,
+    pub duration_secs: u64,
+    pub ends_at: u64,
+    pub original_deadline: u64,
+    pub period_number: u32,
+    pub status: ForbearanceStatus,
+}
+
+// ── Issue #877: Loan Refinancing ──────────────────────────────────────────────
+
+/// A record of a loan refinancing event.
+#[contracttype]
+#[derive(Clone)]
+pub struct RefinanceRecord {
+    pub old_loan_id: u64,
+    pub new_loan_id: u64,
+    pub borrower: Address,
+    pub old_amount: i128,
+    pub new_amount: i128,
+    pub old_rate_bps: i128,
+    pub new_rate_bps: i128,
+    pub refinanced_at: u64,
+}
+
+// ── Issue #881: Dynamic Interest Rate ─────────────────────────────────────────
+
+/// Configuration for dynamic interest rate calculation based on risk score.
+#[contracttype]
+#[derive(Clone, Copy)]
+pub struct DynamicRateConfig {
+    pub enabled: bool,
+    pub base_rate_bps: u32,
+    pub risk_adjustment_bps: u32,
+    pub rate_floor_bps: u32,
+    pub rate_cap_bps: u32,
+}
+
+/// Default dynamic rate configuration (disabled by default).
+pub const DEFAULT_DYNAMIC_RATE_CONFIG: DynamicRateConfig = DynamicRateConfig {
+    enabled: false,
+    base_rate_bps: 200,
+    risk_adjustment_bps: 10,
+    rate_floor_bps: 100,
+    rate_cap_bps: 2_000,
+};
+
+/// Per-borrower dynamic rate record computed and cached on-chain.
+#[contracttype]
+#[derive(Clone)]
+pub struct BorrowerDynamicRate {
+    pub borrower: Address,
+    pub loan_id: u64,
+    pub effective_rate_bps: u32,
+    pub risk_score: u32,
+    pub credit_tier: CreditTier,
+    pub computed_at: u64,
+}
+
+// ── Issue #688 / #689: Admin whitelist/blacklist errors ───────────────────────
+
+// ── Issue #936: Admin Action Proposal ────────────────────────────────────────
+
+/// A proposal for an admin action requiring multi-sig approval.
+#[contracttype]
+#[derive(Clone)]
+pub struct AdminActionProposal {
+    pub id: u64,
+    pub action_type: String,
+    pub proposer: Address,
+    pub approvals: Vec<Address>,
+    pub created_at: u64,
+    pub executed: bool,
+}
+
+// ── Issue #910: Vouch Merkle Root ─────────────────────────────────────────────
+
+/// Vouch Merkle root record stored per borrower.
+#[contracttype]
+#[derive(Clone)]
+pub struct VouchMerkleRoot {
+    pub root: BytesN<32>,
+    pub vouch_count: u32,
+    pub computed_at: u64,
+}
