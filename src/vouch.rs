@@ -6,8 +6,8 @@ use crate::helpers::{
     require_not_thawing, require_reads_allowed, require_positive_amount,
 };
 use crate::types::{
-    BridgeRecord, DataKey, QueuedWithdrawal, VouchHistoryEntry, VouchRecord, VouchMerkleRoot,
-    PARTIAL_WITHDRAWAL_MAX_BPS, PARTIAL_WITHDRAWAL_PENALTY_BPS, BPS_DENOMINATOR,
+    BatchVouchResult, BridgeRecord, DataKey, QueuedWithdrawal, VouchHistoryEntry, VouchRecord,
+    VouchMerkleRoot, PARTIAL_WITHDRAWAL_MAX_BPS, PARTIAL_WITHDRAWAL_PENALTY_BPS, BPS_DENOMINATOR,
 };
 use soroban_sdk::{symbol_short, token, Address, Env, Vec};
 use soroban_sdk::BytesN;
@@ -305,7 +305,7 @@ pub fn batch_vouch(
     stakes: Vec<i128>,
     token: Address,
     chain_id: Option<u32>,
-) -> Result<(), ContractError> {
+) -> Result<Vec<BatchVouchResult>, ContractError> {
     voucher.require_auth();
     require_not_thawing(&env)?;
 
@@ -314,28 +314,76 @@ pub fn batch_vouch(
     }
 
     let cfg = VouchConfig::load(&env);
-
-    // Phase 1: validate all — fail fast before any state mutation
-    for i in 0..borrowers.len() {
-        let borrower = borrowers.get(i).unwrap();
-        let stake = stakes.get(i).unwrap();
-        validate_vouch(&env, &cfg, &voucher, &borrower, stake, &token, chain_id)?;
-    }
-
-    // Phase 2: commit all — only reached if all validations passed
+    // If the token itself is invalid, fail the whole batch before touching anything.
     let token_client = require_allowed_token(&env, &token)?;
+
+    let mut results: Vec<BatchVouchResult> = Vec::new(&env);
+
     for i in 0..borrowers.len() {
         let borrower = borrowers.get(i).unwrap();
         let stake = stakes.get(i).unwrap();
-        let vouches: Vec<VouchRecord> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Vouches(borrower.clone()))
-            .unwrap_or(Vec::new(&env));
-        commit_vouch(&env, &token_client, voucher.clone(), borrower, stake, token.clone(), vouches, chain_id)?;
+
+        match validate_vouch(&env, &cfg, &voucher, &borrower, stake, &token, chain_id) {
+            Err(e) => {
+                env.events().publish(
+                    (symbol_short!("bvouch"), symbol_short!("skip")),
+                    (voucher.clone(), borrower.clone(), stake, e as u32),
+                );
+                results.push_back(BatchVouchResult {
+                    borrower,
+                    stake,
+                    success: false,
+                    error_code: Some(e as u32),
+                });
+            }
+            Ok(_) => {
+                // Re-read vouches at commit time so earlier commits in this batch are visible.
+                let vouches: Vec<VouchRecord> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Vouches(borrower.clone()))
+                    .unwrap_or(Vec::new(&env));
+
+                match commit_vouch(
+                    &env,
+                    &token_client,
+                    voucher.clone(),
+                    borrower.clone(),
+                    stake,
+                    token.clone(),
+                    vouches,
+                    chain_id,
+                ) {
+                    Ok(()) => {
+                        env.events().publish(
+                            (symbol_short!("bvouch"), symbol_short!("ok")),
+                            (voucher.clone(), borrower.clone(), stake),
+                        );
+                        results.push_back(BatchVouchResult {
+                            borrower,
+                            stake,
+                            success: true,
+                            error_code: None,
+                        });
+                    }
+                    Err(e) => {
+                        env.events().publish(
+                            (symbol_short!("bvouch"), symbol_short!("skip")),
+                            (voucher.clone(), borrower.clone(), stake, e as u32),
+                        );
+                        results.push_back(BatchVouchResult {
+                            borrower,
+                            stake,
+                            success: false,
+                            error_code: Some(e as u32),
+                        });
+                    }
+                }
+            }
+        }
     }
 
-    Ok(())
+    Ok(results)
 }
 
 pub fn increase_stake(

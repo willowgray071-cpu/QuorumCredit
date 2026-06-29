@@ -130,6 +130,8 @@ mod refinance_test;
 mod incentives_verification_test;
 #[cfg(test)]
 mod regression_past_bugs_test;
+#[cfg(test)]
+mod batch_vouch_selective_rollback_test;
 
 use crate::helpers::{
     config, get_active_loan_record, has_active_loan, loan_status as helper_loan_status,
@@ -272,7 +274,7 @@ impl QuorumCreditContract {
         stakes: Vec<i128>,
         token: Address,
         chain_id: Option<u32>,
-    ) -> Result<(), ContractError> {
+    ) -> Result<Vec<crate::types::BatchVouchResult>, ContractError> {
         vouch::batch_vouch(env, voucher, borrowers, stakes, token, chain_id)
     }
 
