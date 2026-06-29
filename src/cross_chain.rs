@@ -143,6 +143,20 @@ fn verify_bridge_attestation(
     Ok(())
 }
 
+/// Read-only check: verify a bridge message attestation without consuming the nonce.
+///
+/// Returns `Ok(())` when the Ed25519 signature is valid, the attestation is
+/// fresh, and the nonce has not yet been consumed. No state is written.
+/// Callers can use this before submitting `validate_bridge_attestation` to
+/// confirm the message would be accepted.
+pub fn verify_bridge_message(
+    env: Env,
+    metadata: CrossChainLoanMetadata,
+    attestation: BridgeAttestation,
+) -> Result<(), ContractError> {
+    verify_bridge_attestation(&env, &metadata, &attestation)
+}
+
 /// Verify an attestation and consume its nonce.
 pub fn validate_bridge_attestation(
     env: Env,
@@ -608,5 +622,93 @@ mod tests {
                 )),
             None
         );
+    }
+
+    // ── verify_bridge_message (read-only) ────────────────────────────────────
+
+    #[test]
+    fn verify_bridge_message_valid_attestation_returns_ok() {
+        let f = Fixture::new();
+        let metadata = f.metadata(100);
+        let attestation = f.sign(&metadata, 50, 10_000);
+        let result = f.env.as_contract(&f.contract, || {
+            verify_bridge_message(f.env.clone(), metadata, attestation)
+        });
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn verify_bridge_message_does_not_consume_nonce() {
+        let f = Fixture::new();
+        let metadata = f.metadata(101);
+        let attestation = f.sign(&metadata, 51, 10_000);
+        // Call verify twice — nonce must not be consumed
+        for _ in 0..2 {
+            let r = f.env.as_contract(&f.contract, || {
+                verify_bridge_message(f.env.clone(), metadata.clone(), attestation.clone())
+            });
+            assert_eq!(r, Ok(()));
+        }
+        // Nonce must still be unused
+        assert!(!f
+            .env
+            .as_contract(&f.contract, || is_bridge_nonce_used(f.env.clone(), 1, 51)));
+    }
+
+    #[test]
+    fn verify_bridge_message_rejects_already_used_nonce() {
+        let f = Fixture::new();
+        let metadata = f.metadata(102);
+        let attestation = f.sign(&metadata, 52, 10_000);
+        // Consume the nonce via validate_bridge_attestation
+        f.env
+            .as_contract(&f.contract, || {
+                validate_bridge_attestation(f.env.clone(), metadata.clone(), attestation.clone())
+            })
+            .unwrap();
+        // verify must now detect the spent nonce
+        let r = f.env.as_contract(&f.contract, || {
+            verify_bridge_message(f.env.clone(), metadata, attestation)
+        });
+        assert_eq!(r, Err(ContractError::ReplayAttackDetected));
+    }
+
+    #[test]
+    fn verify_bridge_message_rejects_expired_attestation() {
+        let f = Fixture::new();
+        let metadata = f.metadata(103);
+        let attestation = f.sign(&metadata, 53, 10_000 - MAX_ATTESTATION_AGE_SECS - 1);
+        let r = f.env.as_contract(&f.contract, || {
+            verify_bridge_message(f.env.clone(), metadata, attestation)
+        });
+        assert_eq!(r, Err(ContractError::AttestationExpired));
+    }
+
+    #[test]
+    #[should_panic]
+    fn verify_bridge_message_rejects_invalid_signature() {
+        let f = Fixture::new();
+        let metadata = f.metadata(104);
+        let mut attestation = f.sign(&metadata, 54, 10_000);
+        attestation.signature = BytesN::from_array(&f.env, &[0; 64]);
+        let _ = f.env.as_contract(&f.contract, || {
+            verify_bridge_message(f.env.clone(), metadata, attestation)
+        });
+    }
+
+    #[test]
+    fn verify_bridge_message_rejects_unconfigured_chain() {
+        let f = Fixture::new();
+        let mut metadata = f.metadata(105);
+        metadata.origin_chain = 99;
+        let attestation = BridgeAttestation {
+            signature: BytesN::from_array(&f.env, &[0; 64]),
+            nonce: 55,
+            timestamp: 10_000,
+        };
+        let r = f.env.as_contract(&f.contract, || {
+            verify_bridge_message(f.env.clone(), metadata, attestation)
+        });
+        assert_eq!(r, Err(ContractError::BridgeNotConfigured));
     }
 }

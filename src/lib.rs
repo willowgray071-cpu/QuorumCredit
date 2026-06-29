@@ -1801,6 +1801,16 @@ impl QuorumCreditContract {
         cross_chain::validate_bridge_attestation(env, metadata, attestation)
     }
 
+    /// Issue #968/#85: Read-only integrity check — verifies signature, freshness,
+    /// and nonce without consuming any state. Safe to call multiple times.
+    pub fn verify_bridge_message(
+        env: Env,
+        metadata: CrossChainLoanMetadata,
+        attestation: BridgeAttestation,
+    ) -> Result<(), ContractError> {
+        cross_chain::verify_bridge_message(env, metadata, attestation)
+    }
+
     pub fn bridge_attestation_message(
         env: Env,
         metadata: CrossChainLoanMetadata,
