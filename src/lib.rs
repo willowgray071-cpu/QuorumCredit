@@ -2139,3 +2139,46 @@ pub fn repay(e: Env, borrower: Address, payment: i128) -> Result<(), ContractErr
     // Proceed with existing repayment logic...
     Ok(())
 }
+
+#[derive(Clone)]
+pub struct WithdrawalRecord {
+    pub voucher: Address,
+    pub borrower: Address,
+    pub amount: i128,
+    pub unlock_time: u64,
+}
+
+// Ensure your DataKey enum includes:
+// WithdrawalQueue(Address, Address)
+
+const WITHDRAWAL_COOLDOWN: u64 = 60 * 60 * 24 * 7; // 7 days in seconds
+
+pub fn queue_withdrawal(e: Env, voucher: Address, borrower: Address) -> Result<(), ContractError> {
+    voucher.require_auth();
+    let mut vouch = get_vouch(&e, &voucher, &borrower)?;
+    
+    let unlock_time = e.ledger().timestamp() + WITHDRAWAL_COOLDOWN;
+    let record = WithdrawalRecord {
+        voucher: voucher.clone(),
+        borrower: borrower.clone(),
+        amount: vouch.stake,
+        unlock_time,
+    };
+    
+    e.storage().instance().set(&DataKey::WithdrawalQueue(voucher, borrower), &record);
+    Ok(())
+}
+
+pub fn execute_withdrawal(e: Env, voucher: Address, borrower: Address) -> Result<(), ContractError> {
+    let record: WithdrawalRecord = e.storage().instance().get(&DataKey::WithdrawalQueue(voucher, borrower))
+        .ok_or(ContractError::NoQueuedWithdrawal)?;
+        
+    if e.ledger().timestamp() < record.unlock_time {
+        return Err(ContractError::CooldownNotExpired);
+    }
+    
+    // Transfer stake back to voucher and clear storage
+    e.storage().instance().remove(&DataKey::WithdrawalQueue(voucher, borrower));
+    // ... logic to return funds ...
+    Ok(())
+}
