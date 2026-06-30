@@ -514,6 +514,8 @@ pub fn request_syndication_loan(
         accrued_interest: 0,
         milestone_bonus_applied: false,
         retry_count: 0,
+        suspension_timestamp: None,
+        suspension_amount_repaid: 0,
     };
 
     // Store loan

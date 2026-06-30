@@ -42,6 +42,8 @@ pub const DEFAULT_MAX_VOUCHERS: u32 = 100;
 pub const DEFAULT_MIN_LOAN_AMOUNT: i128 = 100_000;
 /// Default loan duration, in seconds (30 days).
 pub const DEFAULT_LOAN_DURATION: u64 = 30 * 24 * 60 * 60;
+/// Default payment grace period after a suspension, in seconds (3 days).
+pub const PAYMENT_GRACE_PERIOD: u64 = 3 * 24 * 60 * 60;
 /// Default maximum loan-to-stake ratio (150 = 150% — loan ≤ 1.5× total staked).
 pub const DEFAULT_MAX_LOAN_TO_STAKE_RATIO: u32 = 150;
 /// Minimum elapsed time between vouch calls from the same address, in seconds (24 hours).
@@ -251,6 +253,31 @@ pub enum LoanStatus {
     Defaulted,
     /// #664: Default was forgiven by admin.
     ForgivenDefault,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LoanStatusEx {
+    None,
+    Active,
+    Suspended,
+    Repaid,
+    PartialDefault,
+    Defaulted,
+    ForgivenDefault,
+}
+
+impl From<LoanStatus> for LoanStatusEx {
+    fn from(status: LoanStatus) -> Self {
+        match status {
+            LoanStatus::None => LoanStatusEx::None,
+            LoanStatus::Active => LoanStatusEx::Active,
+            LoanStatus::Repaid => LoanStatusEx::Repaid,
+            LoanStatus::PartialDefault => LoanStatusEx::PartialDefault,
+            LoanStatus::Defaulted => LoanStatusEx::Defaulted,
+            LoanStatus::ForgivenDefault => LoanStatusEx::ForgivenDefault,
+        }
+    }
 }
 
 /// Interest rate type for a loan.
@@ -1412,6 +1439,10 @@ pub struct LoanRecord {
     pub milestone_bonus_applied: bool,
     /// Issue #669: Retry count for failed repayments (max 3).
     pub retry_count: u32,
+    /// Timestamp when the loan was suspended due to missed payment.
+    pub suspension_timestamp: Option<u64>,
+    /// Amount repaid when the loan entered suspension.
+    pub suspension_amount_repaid: i128,
 }
 
 /// An archived loan record, stored separately to reduce active persistent storage.

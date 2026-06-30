@@ -3,11 +3,12 @@ use crate::helpers::{
     config, deduct_slash_balance, get_active_loan_record, get_latest_loan_record,
     has_active_loan, next_loan_id, register_borrower_if_needed, require_allowed_token,
     require_not_paused, require_not_thawing, require_admin_approval,
+    require_governance_participant,
 };
 use crate::reputation::ReputationNftExternalClient;
 use crate::types::{
     BorrowerDynamicRate, DataKey, DynamicRateConfig, EscrowStatus,
-    ForbearanceRecord, ForbearanceStatus, LoanRecord, LoanStatus,
+    ForbearanceRecord, ForbearanceStatus, LoanRecord, LoanStatus, LoanStatusEx,
     RefinanceRecord, SlashRecord, VouchRecord, VoucherStats,
     YieldDistributionEntry,
     BPS_DENOMINATOR, DEFAULT_DYNAMIC_RATE_CONFIG, DEFAULT_FORBEARANCE_DURATION_SECS,
@@ -258,6 +259,8 @@ pub fn request_loan(
         accrued_interest: 0,
         milestone_bonus_applied: false,
         retry_count: 0,
+        suspension_timestamp: None,
+        suspension_amount_repaid: 0,
     };
 
     env.storage().persistent().set(&DataKey::Loan(loan_id), &loan);
@@ -659,6 +662,16 @@ pub fn get_loan(env: Env, borrower: Address) -> Option<LoanRecord> {
     get_latest_loan_record(&env, &borrower)
 }
 
+pub fn loan_status_extended(env: Env, borrower: Address) -> LoanStatusEx {
+    if let Some(loan) = get_loan(env, borrower) {
+        if loan.status == LoanStatus::Active && loan.suspension_timestamp.is_some() {
+            return LoanStatusEx::Suspended;
+        }
+        return loan.status.into();
+    }
+    LoanStatusEx::None
+}
+
 pub fn get_loan_by_id(env: Env, loan_id: u64) -> Option<LoanRecord> {
     env.storage().persistent().get(&DataKey::Loan(loan_id))
 }
@@ -667,6 +680,72 @@ pub fn loan_status(env: Env, borrower: Address) -> LoanStatus {
     get_loan(env, borrower)
         .map(|l| l.status)
         .unwrap_or(LoanStatus::None)
+}
+
+pub fn suspend_loan_on_missed_payment(
+    env: Env,
+    caller: Address,
+    borrower: Address,
+) -> Result<(), ContractError> {
+    caller.require_auth();
+    require_not_paused(&env)?;
+    require_governance_participant(&env, &caller)?;
+
+    let mut loan = get_active_loan_record(&env, &borrower)?;
+    let now = env.ledger().timestamp();
+
+    if loan.status != LoanStatus::Active || loan.suspension_timestamp.is_some() {
+        return Err(ContractError::InvalidStateTransition);
+    }
+    if now >= loan.deadline {
+        return Err(ContractError::LoanPastDeadline);
+    }
+
+    loan.suspension_timestamp = Some(now);
+    loan.suspension_amount_repaid = loan.amount_repaid;
+
+    env.storage().persistent().set(&DataKey::Loan(loan.id), &loan);
+    env.events().publish(
+        (symbol_short!("loan"), symbol_short!("suspended")),
+        (borrower.clone(), loan.id, now),
+    );
+
+    Ok(())
+}
+
+pub fn resume_loan(
+    env: Env,
+    caller: Address,
+    borrower: Address,
+) -> Result<(), ContractError> {
+    caller.require_auth();
+    require_not_paused(&env)?;
+    require_governance_participant(&env, &caller)?;
+
+    let mut loan = get_active_loan_record(&env, &borrower)?;
+    let now = env.ledger().timestamp();
+
+    let suspension_ts = loan
+        .suspension_timestamp
+        .ok_or(ContractError::InvalidStateTransition)?;
+
+    if now < suspension_ts.checked_add(crate::types::PAYMENT_GRACE_PERIOD).ok_or(ContractError::ArithmeticError)? {
+        return Err(ContractError::InvalidStateTransition);
+    }
+    if loan.amount_repaid <= loan.suspension_amount_repaid {
+        return Err(ContractError::InvalidStateTransition);
+    }
+
+    loan.suspension_timestamp = None;
+    loan.suspension_amount_repaid = 0;
+
+    env.storage().persistent().set(&DataKey::Loan(loan.id), &loan);
+    env.events().publish(
+        (symbol_short!("loan"), symbol_short!("resumed")),
+        (borrower.clone(), loan.id, now),
+    );
+
+    Ok(())
 }
 
 pub fn repayment_count(env: Env, borrower: Address) -> u32 {
@@ -890,6 +969,8 @@ pub fn refinance_loan(
         accrued_interest: 0,
         milestone_bonus_applied: false,
         retry_count: 0,
+        suspension_timestamp: None,
+        suspension_amount_repaid: 0,
     };
 
     env.storage()
