@@ -434,6 +434,8 @@ pub enum DataKey {
     VoucherInsurance(Address, Address),
     /// Cross-chain bridge validation status: (voucher, chain_id) → bool.
     BridgeValidated(Address, u32),
+    /// Registered cross-chain bridges: Vec<BridgeRecord>
+    Bridges,
     /// Issue #687: admin removal proposal id → AdminRemovalProposal
     AdminRemovalProposal(u64),
     /// Issue #687: monotonically increasing admin removal proposal counter
@@ -1804,3 +1806,18 @@ pub struct WaterfallDistribution {
 /// `CascadingDefaultRecord(u64)` => senior_loan_id -> CascadingDefault
 pub const MAX_SUBORDINATION_DEPTH: u32 = 10; // Prevent deeply nested hierarchies
 pub const MAX_SUBORDINATES_PER_LOAN: u32 = 50; // Prevent excessive branching
+
+/// Result for a single entry in `batch_vouch` with selective rollback semantics (Issue #1055).
+/// Successful entries are committed; failed entries are skipped with an error code.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchVouchResult {
+    /// The borrower address for this entry.
+    pub borrower: Address,
+    /// The stake amount attempted for this entry.
+    pub stake: i128,
+    /// `true` if the vouch was committed successfully; `false` if it was skipped.
+    pub success: bool,
+    /// Error code if `success == false`; `None` when successful.
+    pub error_code: Option<u32>,
+}

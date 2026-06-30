@@ -6,22 +6,94 @@ use crate::helpers::{
     require_not_thawing, require_reads_allowed, require_positive_amount,
 };
 use crate::types::{
-    BridgeRecord, DataKey, QueuedWithdrawal, VouchHistoryEntry, VouchRecord, VouchMerkleRoot,
-    PARTIAL_WITHDRAWAL_MAX_BPS, PARTIAL_WITHDRAWAL_PENALTY_BPS, BPS_DENOMINATOR,
+    BatchVouchResult, BridgeRecord, DataKey, QueuedWithdrawal, VouchHistoryEntry, VouchRecord,
+    VouchMerkleRoot, PARTIAL_WITHDRAWAL_MAX_BPS, PARTIAL_WITHDRAWAL_PENALTY_BPS, BPS_DENOMINATOR,
 };
-use soroban_sdk::{symbol_short, token, Address, Env, Vec};
-use soroban_sdk::BytesN;
+use soroban_sdk::{symbol_short, token, Address, Env, String, Vec};
 
-/// Verify that `token` is accepted by the registered bridge for `chain_id`.
-/// Returns an error if no active bridge record exists for this chain.
-fn validate_bridge(env: &Env, chain_id: u32, _token: &Address) -> Result<(), ContractError> {
-    // Look for an active BridgeRecord for this chain_id via linear scan of known bridge IDs.
-    // If no bridge is configured, reject the cross-chain vouch.
-    let _ = chain_id;
-    let _ = env;
-    // Bridges are registered via admin actions; cross-chain vouches require validation.
-    // Currently we rely on the BridgeValidated per-voucher check in vouch_with_chain.
+/// Verify that an active bridge is registered for `chain_id`.
+/// Returns `InvalidChain` if no active bridge record exists.
+fn validate_bridge(env: &Env, chain_id: u32) -> Result<(), ContractError> {
+    let bridges: Vec<BridgeRecord> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Bridges)
+        .unwrap_or_else(|| Vec::new(env));
+    for bridge in bridges.iter() {
+        if bridge.chain_id == chain_id && bridge.active {
+            return Ok(());
+        }
+    }
+    Err(ContractError::InvalidChain)
+}
+
+/// Admin: register a new cross-chain bridge.
+pub fn register_bridge(
+    env: Env,
+    admin_signers: Vec<Address>,
+    chain_id: u32,
+    chain_name: String,
+    bridge_address: Address,
+) -> Result<(), ContractError> {
+    require_admin_approval(&env, &admin_signers);
+
+    let mut bridges: Vec<BridgeRecord> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Bridges)
+        .unwrap_or_else(|| Vec::new(&env));
+
+    // Reject duplicates
+    for bridge in bridges.iter() {
+        if bridge.chain_id == chain_id {
+            return Err(ContractError::BridgeAlreadyRegistered);
+        }
+    }
+
+    bridges.push_back(BridgeRecord {
+        chain_id,
+        chain_name,
+        bridge_address,
+        active: true,
+    });
+
+    env.storage().persistent().set(&DataKey::Bridges, &bridges);
     Ok(())
+}
+
+/// Admin: deactivate a registered bridge (prevents new cross-chain vouches for that chain).
+pub fn remove_bridge(
+    env: Env,
+    admin_signers: Vec<Address>,
+    chain_id: u32,
+) -> Result<(), ContractError> {
+    require_admin_approval(&env, &admin_signers);
+
+    let mut bridges: Vec<BridgeRecord> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Bridges)
+        .unwrap_or_else(|| Vec::new(&env));
+
+    for i in 0..bridges.len() {
+        let mut bridge = bridges.get(i).unwrap();
+        if bridge.chain_id == chain_id {
+            bridge.active = false;
+            bridges.set(i, bridge);
+            env.storage().persistent().set(&DataKey::Bridges, &bridges);
+            return Ok(());
+        }
+    }
+
+    Err(ContractError::BridgeNotConfigured)
+}
+
+/// Return the list of all registered bridges (active and inactive).
+pub fn get_bridges(env: Env) -> Vec<BridgeRecord> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Bridges)
+        .unwrap_or_else(|| Vec::new(&env))
 }
 
 struct VouchConfig {
@@ -66,7 +138,7 @@ pub fn vouch(
     token: Address,
     chain_id: Option<u32>,
 ) -> Result<(), ContractError> {
-    vouch_with_chain(env, voucher, borrower, stake, token, 0)
+    vouch_with_chain(env, voucher, borrower, stake, token, chain_id.unwrap_or(0))
 }
 
 /// Vouch with cross-chain support. chain_id=0 means native Stellar.
@@ -79,7 +151,7 @@ pub fn vouch_cross_chain(
     token: Address,
     chain_id: u32,
 ) -> Result<(), ContractError> {
-    vouch_with_chain(env, voucher, borrower, stake, token, chain_id)
+    vouch_with_chain(env, voucher, borrower, stake, token, Some(chain_id))
 }
 
 fn vouch_with_chain(
@@ -88,25 +160,18 @@ fn vouch_with_chain(
     borrower: Address,
     stake: i128,
     token: Address,
-    chain_id: u32,
+    chain_id: Option<u32>,
 ) -> Result<(), ContractError> {
     voucher.require_auth();
     require_not_thawing(&env)?;
 
-    // Bridge validation: non-native chain vouches require prior bridge validation
+    // Bridge validation: non-native chain vouches require an active registered bridge
     if chain_id != 0 {
-        let validated: bool = env
-            .storage()
-            .persistent()
-            .get(&DataKey::BridgeValidated(voucher.clone(), chain_id))
-            .unwrap_or(false);
-        if !validated {
-            return Err(ContractError::BridgeNotValidated);
-        }
+        validate_bridge(&env, chain_id)?;
     }
 
     let cfg = VouchConfig::load(&env);
-    do_vouch(&env, &cfg, voucher, borrower, stake, token, Some(chain_id))
+    do_vouch(&env, &cfg, voucher, borrower, stake, token, chain_id)
 }
 
 fn validate_vouch<'a>(
@@ -146,10 +211,9 @@ fn validate_vouch<'a>(
 
     let token_client = require_allowed_token(env, token)?;
 
-    // Bridge validation: if chain_id is provided, the token must originate from
-    // a registered, active bridge for that chain.
+    // Bridge validation: if chain_id is provided, check against registered bridge registry
     if let Some(cid) = chain_id {
-        validate_bridge(env, cid, token)?;
+        validate_bridge(env, cid)?;
     }
 
     if cfg.min_stake > 0 && stake < cfg.min_stake {
@@ -305,7 +369,7 @@ pub fn batch_vouch(
     stakes: Vec<i128>,
     token: Address,
     chain_id: Option<u32>,
-) -> Result<(), ContractError> {
+) -> Result<Vec<BatchVouchResult>, ContractError> {
     voucher.require_auth();
     require_not_thawing(&env)?;
 
@@ -314,28 +378,76 @@ pub fn batch_vouch(
     }
 
     let cfg = VouchConfig::load(&env);
-
-    // Phase 1: validate all — fail fast before any state mutation
-    for i in 0..borrowers.len() {
-        let borrower = borrowers.get(i).unwrap();
-        let stake = stakes.get(i).unwrap();
-        validate_vouch(&env, &cfg, &voucher, &borrower, stake, &token, chain_id)?;
-    }
-
-    // Phase 2: commit all — only reached if all validations passed
+    // If the token itself is invalid, fail the whole batch before touching anything.
     let token_client = require_allowed_token(&env, &token)?;
+
+    let mut results: Vec<BatchVouchResult> = Vec::new(&env);
+
     for i in 0..borrowers.len() {
         let borrower = borrowers.get(i).unwrap();
         let stake = stakes.get(i).unwrap();
-        let vouches: Vec<VouchRecord> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Vouches(borrower.clone()))
-            .unwrap_or(Vec::new(&env));
-        commit_vouch(&env, &token_client, voucher.clone(), borrower, stake, token.clone(), vouches, chain_id)?;
+
+        match validate_vouch(&env, &cfg, &voucher, &borrower, stake, &token, chain_id) {
+            Err(e) => {
+                env.events().publish(
+                    (symbol_short!("bvouch"), symbol_short!("skip")),
+                    (voucher.clone(), borrower.clone(), stake, e as u32),
+                );
+                results.push_back(BatchVouchResult {
+                    borrower,
+                    stake,
+                    success: false,
+                    error_code: Some(e as u32),
+                });
+            }
+            Ok(_) => {
+                // Re-read vouches at commit time so earlier commits in this batch are visible.
+                let vouches: Vec<VouchRecord> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Vouches(borrower.clone()))
+                    .unwrap_or(Vec::new(&env));
+
+                match commit_vouch(
+                    &env,
+                    &token_client,
+                    voucher.clone(),
+                    borrower.clone(),
+                    stake,
+                    token.clone(),
+                    vouches,
+                    chain_id,
+                ) {
+                    Ok(()) => {
+                        env.events().publish(
+                            (symbol_short!("bvouch"), symbol_short!("ok")),
+                            (voucher.clone(), borrower.clone(), stake),
+                        );
+                        results.push_back(BatchVouchResult {
+                            borrower,
+                            stake,
+                            success: true,
+                            error_code: None,
+                        });
+                    }
+                    Err(e) => {
+                        env.events().publish(
+                            (symbol_short!("bvouch"), symbol_short!("skip")),
+                            (voucher.clone(), borrower.clone(), stake, e as u32),
+                        );
+                        results.push_back(BatchVouchResult {
+                            borrower,
+                            stake,
+                            success: false,
+                            error_code: Some(e as u32),
+                        });
+                    }
+                }
+            }
+        }
     }
 
-    Ok(())
+    Ok(results)
 }
 
 pub fn increase_stake(
