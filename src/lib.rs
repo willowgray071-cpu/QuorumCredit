@@ -1035,6 +1035,22 @@ impl QuorumCreditContract {
         helper_loan_status(&env, &borrower)
     }
 
+    pub fn loan_status_extended(env: Env, borrower: Address) -> LoanStatusEx {
+        loan::loan_status_extended(env, borrower)
+    }
+
+    pub fn suspend_loan_on_missed_payment(
+        env: Env,
+        caller: Address,
+        borrower: Address,
+    ) -> Result<(), ContractError> {
+        loan::suspend_loan_on_missed_payment(env, caller, borrower)
+    }
+
+    pub fn resume_loan(env: Env, caller: Address, borrower: Address) -> Result<(), ContractError> {
+        loan::resume_loan(env, caller, borrower)
+    }
+
     // ── Issue #880: Loan Co-Borrower Support ─────────────────────────────────
 
     pub fn add_co_borrower(

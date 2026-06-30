@@ -508,7 +508,12 @@ pub fn request_syndication_loan(
         maturity_date: None,
         rate_type: crate::types::RateType::Fixed,
         index_reference: None,
+        last_interest_calc: now,
+        accrued_interest: 0,
+        milestone_bonus_applied: false,
         retry_count: 0,
+        suspension_timestamp: None,
+        suspension_amount_repaid: 0,
     };
 
     // Store loan
