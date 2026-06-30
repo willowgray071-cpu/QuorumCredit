@@ -9,6 +9,7 @@ use crate::types::{
     BorrowerDynamicRate, DataKey, DynamicRateConfig, EscrowStatus,
     ForbearanceRecord, ForbearanceStatus, LoanRecord, LoanStatus,
     RefinanceRecord, SlashRecord, VouchRecord, VoucherStats,
+    YieldDistributionEntry,
     BPS_DENOMINATOR, DEFAULT_DYNAMIC_RATE_CONFIG, DEFAULT_FORBEARANCE_DURATION_SECS,
     MAX_FORBEARANCE_PERIODS, REPUTATION_BONUS_MAX_BPS, SLASH_ESCROW_PERIOD,
 };
@@ -79,6 +80,7 @@ fn vouch_yield_bps_uncached(env: &Env, vouch: &VouchRecord, borrower: &Address, 
         .persistent()
         .get(&DataKey::VoucherStats(vouch.voucher.clone()));
     let voucher_rep_bonus = voucher_stats
+        .as_ref()
         .map(|s| (s.successful_vouches as i128 * 10).min(REPUTATION_BONUS_MAX_BPS))
         .unwrap_or(0);
 
@@ -105,7 +107,23 @@ fn vouch_yield_bps_uncached(env: &Env, vouch: &VouchRecord, borrower: &Address, 
         })
         .unwrap_or(0);
 
-    (base_bps + age_bonus + rep_bonus + voucher_rep_bonus + reliability_bonus).max(0)
+    // ── Diversification bonus ─────────────────────────────────────────────────
+    // +50 bps per additional unique borrower, max 500 bps (5%)
+    let history: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::VoucherHistory(vouch.voucher.clone()))
+        .unwrap_or(Vec::new(env));
+    let mut unique_borrowers = Vec::new(env);
+    for b in history.iter() {
+        if !unique_borrowers.iter().any(|ub| ub == &b) {
+            unique_borrowers.push_back(b.clone());
+        }
+    }
+    let unique_count = unique_borrowers.len() as i128;
+    let diversification_bonus = ((unique_count - 1) * 50).min(500);
+
+    (base_bps + age_bonus + rep_bonus + voucher_rep_bonus + reliability_bonus + diversification_bonus).max(0)
 }
 
 /// Calculate dynamic yield (legacy — used for backward-compat; prefer vouch_yield_bps per vouch).
@@ -236,6 +254,9 @@ pub fn request_loan(
         maturity_date: None,
         rate_type: crate::types::RateType::Fixed,
         index_reference: None,
+        last_interest_calc: now,
+        accrued_interest: 0,
+        milestone_bonus_applied: false,
         retry_count: 0,
     };
 
@@ -327,7 +348,7 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
              let l = get_latest_loan_record(&env, &borrower).ok_or(ContractError::NoActiveLoan)?;
              if l.status != LoanStatus::Defaulted {
                  env.events().publish(
-                     (symbol_short!("loan"), symbol_short!("repayment_failure")),
+                     (symbol_short!("loan"), symbol_short!("repay_err")),
                      (borrower.clone(), payment),
                  );
                  return Err(ContractError::NoActiveLoan);
@@ -336,7 +357,7 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
          }
          Err(e) => {
              env.events().publish(
-                 (symbol_short!("loan"), symbol_short!("repayment_failure")),
+                 (symbol_short!("loan"), symbol_short!("repay_err")),
                  (borrower.clone(), payment),
              );
              return Err(e);
@@ -1131,7 +1152,7 @@ pub fn set_loan_guarantor(
         return Err(ContractError::InvalidStateTransition);
     }
 
-    loan.guarantor = Some(guarantor);
+    loan.guarantor = Some(guarantor.clone());
 
     env.storage()
         .persistent()
@@ -1182,7 +1203,7 @@ pub fn set_buyback_price(
         .set(&DataKey::Loan(loan.id), &loan);
 
     env.events().publish(
-        (symbol_short!("loan"), symbol_short!("buyback_set")),
+        (symbol_short!("loan"), symbol_short!("bkset")),
         (borrower, price),
     );
 
@@ -1204,11 +1225,12 @@ pub fn buyback_loan(
         return Err(ContractError::InvalidStateTransition);
     }
 
-    let total_stake: i128 = env
+    let vouches: soroban_sdk::Vec<VouchRecord> = env
         .storage()
         .persistent()
         .get(&DataKey::Vouches(borrower.clone()))
-        .unwrap_or(Vec::new(&env))
+        .unwrap_or(soroban_sdk::Vec::new(&env));
+    let total_stake: i128 = vouches
         .iter()
         .filter(|v| v.voucher == voucher && v.token == loan.token_address)
         .map(|v| v.stake)
@@ -1255,7 +1277,7 @@ pub fn enable_auto_repay(env: Env, borrower: Address) -> Result<(), ContractErro
         .set(&DataKey::Loan(loan.id), &loan);
 
     env.events().publish(
-        (symbol_short!("loan"), symbol_short!("auto_repay_on")),
+        (symbol_short!("loan"), symbol_short!("arpay_on")),
         borrower,
     );
 
@@ -1416,7 +1438,7 @@ pub fn disable_auto_repay(env: Env, borrower: Address) -> Result<(), ContractErr
         .set(&DataKey::Loan(loan.id), &loan);
 
     env.events().publish(
-        (symbol_short!("loan"), symbol_short!("auto_repay_off")),
+        (symbol_short!("loan"), symbol_short!("arpay_off")),
         borrower,
     );
 
