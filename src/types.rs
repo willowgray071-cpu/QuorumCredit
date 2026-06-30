@@ -351,6 +351,11 @@ pub enum DataKey {
     DeploymentRecordCount,
     /// Issue #744: rollback snapshot of config keyed by version index
     RollbackSnapshot(u32),
+    /// Reentrancy guard lock — bool, true when a guarded function is executing.
+    Locked,
+    /// Emergency admin revocation record — Address → bool (true = revoked).
+    /// Revoked admins are excluded from admin approval checks.
+    RevokedAdmin(Address),
 }
 
 // ── Governance ────────────────────────────────────────────────────────────────
@@ -468,6 +473,27 @@ pub struct Config {
     /// when current admins are unavailable.
     pub successor_admin: Option<Address>,
     pub rate_limit_config: RateLimitConfig,
+    /// When true, slash penalty adjusts dynamically based on protocol health.
+    /// When false (default), uses static `slash_bps`.
+    pub dynamic_slash_threshold: bool,
+    /// When true, slash percentage scales linearly with loan size relative to total staked collateral.
+    pub loan_size_slash_enabled: bool,
+    /// Maximum slash rate (in bps) applied to the largest loans when loan-size scaling is enabled.
+    pub loan_size_slash_max_bps: i128,
+    /// Recovery percentage (in bps) of slashed stake returned to vouchers on successful recovery.
+    pub recovery_percentage: u32,
+    /// Admin compensation rate in basis points distributed from the compensation pool.
+    pub admin_compensation_bps: u32,
+    /// Minimum fraction of admins (in basis points) required to pass a removal vote.
+    pub removal_vote_threshold: u32,
+    /// When true, borrowers must call `confirm_repayment` before `repay` is processed.
+    pub confirmation_required: bool,
+    /// Controls where redistributable slash funds flow after insurance allocation.
+    pub redistribution_rule: RedistributionRule,
+    /// Seconds after repayment during which a borrower is immune from slash votes (0 = disabled).
+    pub immunity_period_seconds: u64,
+    /// Insurance premium charged on loan disbursement, in basis points (e.g. 100 = 1%).
+    pub insurance_premium_bps: u32,
 }
 
 // ── Data Types ────────────────────────────────────────────────────────────────

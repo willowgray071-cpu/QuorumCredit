@@ -1313,3 +1313,113 @@ pub fn set_role_permissions(
         .persistent()
         .set(&DataKey::RolePermissions(account), &permissions);
 }
+
+/// Emergency admin revocation — removes a compromised admin key with N-1 approval.
+///
+/// This function allows the remaining admins to revoke a compromised key without
+/// any participation from the compromised key itself. It requires ALL other admins
+/// (i.e. N-1 of N total) to sign, providing a higher bar than the standard
+/// `admin_threshold` to prevent abuse.
+///
+/// # Arguments
+/// * `existing_admins` - All non-compromised admin addresses signing this revocation
+///   (must be every current admin except `target_admin`; must equal N-1)
+/// * `target_admin` - The compromised admin address to revoke
+/// * `reason` - Human-readable reason for the revocation (stored in the event)
+///
+/// # Errors
+/// * `AdminNotFound` - If `target_admin` is not a current admin
+/// * `AdminAlreadyRevoked` - If `target_admin` is already revoked
+/// * `UnauthorizedCaller` - If `existing_admins` count < N-1 (all non-compromised admins required)
+/// * `InvalidAdminThreshold` - If revocation would reduce admin count below 1
+pub fn revoke_admin(
+    env: Env,
+    existing_admins: Vec<Address>,
+    target_admin: Address,
+    reason: soroban_sdk::String,
+) -> Result<(), ContractError> {
+    let cfg = config(&env);
+
+    // 1. Verify target is actually a current admin
+    if !cfg.admins.iter().any(|a| a == target_admin) {
+        return Err(ContractError::AdminNotFound);
+    }
+
+    // 2. Verify target is not already revoked
+    let already_revoked: bool = env
+        .storage()
+        .persistent()
+        .get(&DataKey::RevokedAdmin(target_admin.clone()))
+        .unwrap_or(false);
+    if already_revoked {
+        return Err(ContractError::AdminAlreadyRevoked);
+    }
+
+    // 3. Compute the required N-1 threshold — every admin except the target must sign
+    let total_admins = cfg.admins.len();
+    let required = total_admins
+        .checked_sub(1)
+        .expect("no admins to revoke from");
+
+    // Must have at least 1 remaining admin after revocation
+    if required == 0 {
+        return Err(ContractError::InvalidAdminThreshold);
+    }
+
+    // 4. Validate that `existing_admins` has exactly N-1 entries,
+    //    all are real admins (not the target), and none is the target
+    if existing_admins.len() < required {
+        return Err(ContractError::UnauthorizedCaller);
+    }
+
+    for signer in existing_admins.iter() {
+        // Each signer must be a registered admin
+        if !cfg.admins.iter().any(|a| a == signer) {
+            return Err(ContractError::UnauthorizedCaller);
+        }
+        // The target cannot sign their own revocation
+        if signer == target_admin {
+            return Err(ContractError::UnauthorizedCaller);
+        }
+        // Collect Soroban auth from each signer
+        signer.require_auth();
+    }
+
+    // 5. Remove target from the active admin list in Config
+    let mut updated_cfg = cfg;
+    let idx = updated_cfg
+        .admins
+        .iter()
+        .position(|a| a == target_admin)
+        .expect("target admin must be in list") as u32;
+    updated_cfg.admins.remove(idx);
+
+    // 6. Adjust threshold if it now exceeds the remaining admin count
+    if updated_cfg.admin_threshold > updated_cfg.admins.len() {
+        updated_cfg.admin_threshold = updated_cfg.admins.len();
+    }
+
+    // 7. Persist config and mark admin as revoked in persistent storage
+    env.storage()
+        .instance()
+        .set(&DataKey::Config, &updated_cfg);
+    env.storage()
+        .persistent()
+        .set(&DataKey::RevokedAdmin(target_admin.clone()), &true);
+
+    // 8. Emit revocation event with reason
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("revoked")),
+        (target_admin, reason, env.ledger().timestamp()),
+    );
+
+    Ok(())
+}
+
+/// Check whether an address has been emergency-revoked.
+pub fn is_admin_revoked(env: Env, admin: Address) -> bool {
+    env.storage()
+        .persistent()
+        .get::<DataKey, bool>(&DataKey::RevokedAdmin(admin))
+        .unwrap_or(false)
+}

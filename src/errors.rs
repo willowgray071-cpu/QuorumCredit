@@ -88,4 +88,16 @@ pub enum ContractError {
     ArithmeticError = 62,
     /// No rollback snapshot found for the requested deployment index (#744).
     RollbackSnapshotNotFound = 63,
+    /// Admin address is not on the whitelist.
+    AdminNotWhitelisted = 64,
+    /// Admin address is on the blacklist.
+    AdminBlacklisted = 65,
+    /// Reentrancy detected — a guarded function was re-entered before the lock was released.
+    Reentrancy = 66,
+    /// Borrower is immune from being slashed (e.g. repaid within grace period).
+    BorrowerImmune = 67,
+    /// Target admin has already been revoked and cannot be revoked again.
+    AdminAlreadyRevoked = 68,
+    /// The target of revocation is not a current admin.
+    AdminNotFound = 69,
 }

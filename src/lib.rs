@@ -44,6 +44,8 @@ mod cross_chain_vouch_test;
 mod property_stake_loan_invariants_test;
 #[cfg(test)]
 mod admin_whitelist_blacklist_test;
+#[cfg(test)]
+mod emergency_admin_revocation_test;
 
 use crate::helpers::{
     config, get_active_loan_record, has_active_loan, loan_status as helper_loan_status,
@@ -97,19 +99,6 @@ impl QuorumCreditContract {
                 loan_duration: DEFAULT_LOAN_DURATION,
                 max_loan_to_stake_ratio: DEFAULT_MAX_LOAN_TO_STAKE_RATIO,
                 grace_period: 0,
-            },
-        );
-
-        env.events().publish(
-            (symbol_short!("contract"), symbol_short!("init")),
-            (deployer, admins, admin_threshold, token),
-        );
-
-        Ok(())
-    }
-
-    // ── Vouching ──────────────────────────────────────────────────────────────
-
                 min_vouch_age_secs: DEFAULT_MIN_VOUCH_AGE_SECS,
                 prepayment_penalty_bps: 0,
                 liquidity_mining_rate_bps: DEFAULT_LIQUIDITY_MINING_RATE_BPS,
@@ -120,6 +109,21 @@ impl QuorumCreditContract {
                 oracle_address: None,
                 slash_delay_seconds: 0,
                 successor_admin: None,
+                rate_limit_config: RateLimitConfig {
+                    window_secs: DEFAULT_RATE_LIMIT_WINDOW_SECS,
+                    max_calls: DEFAULT_RATE_LIMIT_COUNT,
+                    enabled: false,
+                },
+                dynamic_slash_threshold: DEFAULT_DYNAMIC_SLASH_THRESHOLD,
+                loan_size_slash_enabled: DEFAULT_LOAN_SIZE_SLASH_ENABLED,
+                loan_size_slash_max_bps: DEFAULT_LOAN_SIZE_SLASH_MAX_BPS,
+                recovery_percentage: 0,
+                admin_compensation_bps: 0,
+                removal_vote_threshold: 0,
+                confirmation_required: DEFAULT_CONFIRMATION_REQUIRED,
+                redistribution_rule: RedistributionRule::Treasury,
+                immunity_period_seconds: 0,
+                insurance_premium_bps: 0,
             },
         );
 

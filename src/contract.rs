@@ -52,6 +52,8 @@ impl QuorumCreditContract {
             &Config {
                 admins: admins.clone(),
                 admin_threshold,
+                admin_whitelist: Vec::new(&env),
+                admin_blacklist: Vec::new(&env),
                 token: token.clone(),
                 allowed_tokens: Vec::new(&env),
                 yield_bps: DEFAULT_YIELD_BPS,
@@ -71,7 +73,21 @@ impl QuorumCreditContract {
                 voting_period_seconds: crate::types::DEFAULT_VOTING_PERIOD_SECONDS,
                 slash_cooldown_seconds: 0,
                 emergency_pause_enabled: false,
+                early_repayment_discount_bps: 0,
+                oracle_address: None,
+                slash_delay_seconds: 0,
                 successor_admin: None,
+                rate_limit_config: crate::types::RateLimitConfig {
+                    window_secs: crate::types::DEFAULT_RATE_LIMIT_WINDOW_SECS,
+                    max_calls: crate::types::DEFAULT_RATE_LIMIT_COUNT,
+                    enabled: false,
+                },
+                dynamic_slash_threshold: DEFAULT_DYNAMIC_SLASH_THRESHOLD,
+                loan_size_slash_enabled: DEFAULT_LOAN_SIZE_SLASH_ENABLED,
+                loan_size_slash_max_bps: DEFAULT_LOAN_SIZE_SLASH_MAX_BPS,
+                admin_compensation_bps: 0,
+                removal_vote_threshold: 0,
+                confirmation_required: DEFAULT_CONFIRMATION_REQUIRED,
             },
         );
 
@@ -522,6 +538,50 @@ impl QuorumCreditContract {
     /// * If removal would leave fewer admins than threshold
     pub fn remove_admin(env: Env, admin_signers: Vec<Address>, admin_to_remove: Address) {
         admin::remove_admin(env, admin_signers, admin_to_remove)
+    }
+
+    /// Emergency admin revocation — removes a compromised admin key with N-1 approval.
+    ///
+    /// This is an emergency mechanism: if one admin key is compromised, ALL remaining
+    /// admins (N-1 of N) can instantly revoke the compromised key. The revoked address
+    /// is permanently blacklisted from participating in admin approvals and is removed
+    /// from the active admin list.
+    ///
+    /// Unlike `remove_admin` (which uses the standard `admin_threshold`), this function
+    /// requires every non-compromised admin to sign — a stricter requirement that prevents
+    /// a single admin from unilaterally removing another.
+    ///
+    /// # Arguments
+    /// * `existing_admins` - All current admin signers excluding `target_admin` (must be N-1)
+    /// * `target_admin` - The compromised admin address to revoke
+    /// * `reason` - Human-readable reason for revocation (emitted in event)
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    ///
+    /// # Errors
+    /// * `ContractError::AdminNotFound` - `target_admin` is not a registered admin
+    /// * `ContractError::AdminAlreadyRevoked` - `target_admin` was already revoked
+    /// * `ContractError::UnauthorizedCaller` - Fewer than N-1 valid signers provided
+    /// * `ContractError::InvalidAdminThreshold` - Only 1 admin exists; cannot revoke
+    pub fn revoke_admin(
+        env: Env,
+        existing_admins: Vec<Address>,
+        target_admin: Address,
+        reason: soroban_sdk::String,
+    ) -> Result<(), ContractError> {
+        admin::revoke_admin(env, existing_admins, target_admin, reason)
+    }
+
+    /// Check whether an admin address has been emergency-revoked.
+    ///
+    /// # Arguments
+    /// * `admin` - Address to query
+    ///
+    /// # Returns
+    /// * `true` if the address has been revoked via `revoke_admin`
+    pub fn is_admin_revoked(env: Env, admin: Address) -> bool {
+        admin::is_admin_revoked(env, admin)
     }
 
     /// Rotate an admin address to a new address.

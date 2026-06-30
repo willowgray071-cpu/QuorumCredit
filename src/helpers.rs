@@ -230,6 +230,13 @@ pub fn require_admin_approval(env: &Env, admin_signers: &Vec<Address>) {
             cfg.admins.iter().any(|a| a == signer),
             "signer is not a registered admin"
         );
+        // Reject any signer whose key has been emergency-revoked
+        let revoked: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RevokedAdmin(signer.clone()))
+            .unwrap_or(false);
+        assert!(!revoked, "signer has been emergency-revoked");
         signer.require_auth();
     }
 }
