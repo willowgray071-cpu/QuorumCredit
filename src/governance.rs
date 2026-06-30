@@ -7,17 +7,18 @@ use crate::types::{
     AppealStatus, DataKey, LoanStatus, PendingSlashRecord, SlashEscrowAppealRecord, SlashEscrow,
     SlashRecord, SlashThresholdProposal, SlashVoteRecord, TimelockAction, TimelockProposal,
     VouchRecord, BPS_DENOMINATOR, APPEAL_OVERRIDE_QUORUM_BPS, SLASH_APPEAL_PERIOD,
+    DEFAULT_SLASH_VOTE_QUORUM_BPS, DEFAULT_SLASH_PROPOSAL_COOLDOWN_SECS,
 };
 use soroban_sdk::{panic_with_error, symbol_short, Address, Env, Vec};
-
-/// Default quorum: 50% of total vouched stake must approve.
-const DEFAULT_SLASH_VOTE_QUORUM_BPS: u32 = 5_000;
 
 /// Cast a governance vote on whether `borrower` should be slashed.
 ///
 /// - Only active vouchers (those with a stake in `Vouches(borrower)`) may vote.
 /// - Votes are weighted by the voucher's current stake.
-/// - When `approve_stake * BPS_DENOMINATOR / total_stake >= quorum_bps`, slash is auto-executed.
+/// - When `approve_stake * BPS_DENOMINATOR / total_stake >= quorum_bps` (default ≈ 66.67%),
+///   slash is auto-executed.
+/// - A 7-day cooldown between successive slash *proposals* for the same borrower is enforced
+///   to prevent spam. The cooldown is measured from when the previous proposal was initiated.
 pub fn vote_slash(
     env: Env,
     voucher: Address,
@@ -40,6 +41,8 @@ pub fn vote_slash(
 
     let cfg = config(&env);
     let now = env.ledger().timestamp();
+
+    // Enforce slash cooldown (time since last *executed* slash).
     if cfg.slash_cooldown_seconds > 0 {
         if let Some(last) = env
             .storage()
@@ -95,6 +98,7 @@ pub fn vote_slash(
 
     if vote.executed {
         if has_active_loan(&env, &borrower) {
+            // This is a fresh loan — reset the vote record for the new proposal.
             vote = SlashVoteRecord {
                 approve_stake: 0,
                 reject_stake: 0,
@@ -104,6 +108,32 @@ pub fn vote_slash(
         } else {
             panic_with_error!(&env, ContractError::SlashAlreadyExecuted);
         }
+    }
+
+    // Enforce proposal cooldown: if this voucher is casting the *first* vote on this proposal
+    // (voters list is empty, meaning the proposal is being freshly initiated), check that the
+    // minimum time has elapsed since the last proposal was started for this borrower.
+    // This prevents spam proposals (default 7-day cooldown between proposals).
+    if vote.voters.is_empty() {
+        let proposal_cooldown = DEFAULT_SLASH_PROPOSAL_COOLDOWN_SECS;
+        if let Some(last_proposal_at) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u64>(&DataKey::LastSlashProposalAt(borrower.clone()))
+        {
+            if now.saturating_sub(last_proposal_at) < proposal_cooldown {
+                return Err(ContractError::SlashCooldownActive);
+            }
+        }
+        // Record the proposal initiation timestamp.
+        env.storage()
+            .persistent()
+            .set(&DataKey::LastSlashProposalAt(borrower.clone()), &now);
+
+        env.events().publish(
+            (symbol_short!("gov"), symbol_short!("slsh_init")),
+            (borrower.clone(), now),
+        );
     }
 
     // Prevent double-voting.
@@ -123,7 +153,7 @@ pub fn vote_slash(
         (voucher.clone(), borrower.clone(), approve, voucher_stake),
     );
 
-    // Check quorum.
+    // Check quorum (default ≈ 66.67% of total stake must approve).
     let quorum_bps: u32 = env
         .storage()
         .instance()
@@ -142,23 +172,23 @@ pub fn vote_slash(
         env.storage()
             .persistent()
             .set(&DataKey::SlashVote(borrower.clone()), &vote);
-        
+
         // Instead of immediately executing, create a pending slash record
         let cfg = config(&env);
         let now = env.ledger().timestamp();
         let executable_at = now + cfg.slash_delay_seconds;
-        
+
         let pending_slash = PendingSlashRecord {
             borrower: borrower.clone(),
             approved_at: now,
             executable_at,
             executed: false,
         };
-        
+
         env.storage()
             .persistent()
             .set(&DataKey::PendingSlashExecution(borrower.clone()), &pending_slash);
-        
+
         env.events().publish(
             (symbol_short!("gov"), symbol_short!("slsh_pend")),
             (borrower.clone(), now, executable_at),
@@ -199,6 +229,7 @@ pub fn get_slash_vote_quorum(env: Env) -> u32 {
 
 /// Execute a slash vote if quorum has been met.
 /// Anyone can call this function to execute a slash once quorum is reached.
+/// Requires approximately 2/3 (6667 bps) of total vouched stake to have approved.
 pub fn execute_slash_vote(env: Env, borrower: Address) -> Result<(), ContractError> {
     require_not_paused(&env)?;
 
@@ -220,11 +251,20 @@ pub fn execute_slash_vote(env: Env, borrower: Address) -> Result<(), ContractErr
         .unwrap_or(Vec::new(&env));
     let total_stake: i128 = vouches.iter().map(|v| v.stake).sum();
 
-    // Retrieve quorum threshold
-    let quorum_bps: u32 = get_slash_vote_quorum(env.clone());
+    // Retrieve quorum threshold (default ≈ 66.67%)
+    let quorum_bps: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::SlashVoteQuorum)
+        .unwrap_or(DEFAULT_SLASH_VOTE_QUORUM_BPS);
 
-    // Calculate required quorum stake
-    let quorum_stake = total_stake * quorum_bps as i128 / 10_000;
+    // Calculate required quorum stake using ceiling division
+    let quorum_stake = (total_stake
+        .checked_mul(quorum_bps as i128)
+        .unwrap_or(i128::MAX)
+        .checked_add(BPS_DENOMINATOR - 1)
+        .unwrap_or(i128::MAX))
+        / BPS_DENOMINATOR;
 
     // Check if approval stake meets quorum
     if vote.approve_stake < quorum_stake {

@@ -47,6 +47,8 @@ mod slash_threshold_voting_test;
 #[cfg(test)]
 mod slash_cooldown_test;
 #[cfg(test)]
+mod slash_voting_flow_test;
+#[cfg(test)]
 mod config_update_voting_test;
 #[cfg(test)]
 mod referral_test;
@@ -2094,7 +2096,6 @@ impl QuorumCreditContract {
     ) -> VouchPage {
         admin::get_vouches_paginated(env, borrower, cursor, page_size)
     }
-}
 
     // ── Issue #893: Multi-Tier Admin Approval ──────────────────────────────────
 
