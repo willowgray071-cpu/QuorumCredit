@@ -178,4 +178,18 @@ MaxExtensionsReached = 139,
 LoanPrivacyRestricted = 140,
 /// Insurance pool is not connected to this loan.
 InsuranceNotLinked = 141,
+/// No relay verification key is configured for the source chain.
+RelayKeyNotConfigured = 142,
+/// Relay chain id is zero or otherwise invalid.
+InvalidRelayChain = 143,
+/// A relay attestation reused an already-consumed nonce.
+RelayReplayDetected = 144,
+/// The relay attestation is older than the freshness window allows.
+RelayEventExpired = 145,
+/// The relay attestation is timestamped too far in the future.
+RelayEventFromFuture = 146,
+/// A relay event with this (source chain, sequence) was already processed.
+RelayEventAlreadyProcessed = 147,
+/// A relay acknowledgement tried to move the cursor backwards.
+RelayAckRegression = 148,
 }
