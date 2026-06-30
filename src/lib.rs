@@ -30,6 +30,8 @@ pub mod vouch_groups;
 pub mod yield_stream;
 /// Issue #887: Loan Subordination and Cascading Debt Hierarchy
 pub mod subordination;
+/// Issue #88: Liquidity Rebalancing — auto-rebalance collateral pools
+pub mod liquidity_rebalance;
 
 pub use errors::ContractError;
 pub use types::*;
@@ -941,6 +943,35 @@ impl QuorumCreditContract {
             .instance()
             .get(&DataKey::LoanPoolCounter)
             .unwrap_or(0)
+    }
+
+    // ── Liquidity Rebalancing (Issue #88) ─────────────────────────────────────
+
+    /// Manually move `amount` stroops of stake from `source_pool_id` to `target_pool_id`.
+    /// Both pools must be inactive and share the same token.
+    pub fn rebalance_pools(
+        env: Env,
+        admin_signers: Vec<Address>,
+        source_pool_id: u64,
+        target_pool_id: u64,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        liquidity_rebalance::rebalance_pools(env, admin_signers, source_pool_id, target_pool_id, amount)
+    }
+
+    /// Automatically rebalance all inactive collateral pools toward `target_stake`.
+    /// Returns the number of transfers performed.
+    pub fn auto_rebalance_pools(
+        env: Env,
+        admin_signers: Vec<Address>,
+        target_stake: i128,
+    ) -> Result<u32, ContractError> {
+        liquidity_rebalance::auto_rebalance_pools(env, admin_signers, target_stake)
+    }
+
+    /// Return total stake held in a collateral pool.
+    pub fn get_pool_liquidity(env: Env, pool_id: u64) -> Result<i128, ContractError> {
+        liquidity_rebalance::get_pool_liquidity(env, pool_id)
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────────
