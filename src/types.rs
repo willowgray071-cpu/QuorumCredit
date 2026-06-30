@@ -333,6 +333,7 @@ pub enum DataKey {
     LoanPoolCounter, // u64: monotonically increasing pool ID counter
     PendingAdmin,    // Address of the pending admin (two-step transfer)
     RepaymentCount(Address), // borrower → u32 total successful repayments
+    RepaymentConfirmation(u64), // loan_id → bool confirmation flag
     LoanCount(Address), // borrower → u32 total historical loans disbursed
     DefaultCount(Address), // borrower → u32 total defaults (slash + auto_slash + claim_expired)
     ProtocolFeeBps,  // u32: protocol fee in basis points
@@ -1191,7 +1192,9 @@ pub struct LoanRecord {
     /// Yield owed to vouchers, locked in at disbursement time, in stroops.
     /// Computed as `amount * yield_bps / 10_000`. 1 XLM = 10,000,000 stroops.
     pub total_yield: i128,
-    pub status: LoanStatus,
+        pub status: LoanStatus,
+    pub repaid: bool,
+    pub defaulted: bool,
     /// Ledger timestamp when the loan record was created.
     pub created_at: u64,
     /// Ledger timestamp when the loan was disbursed to the borrower.

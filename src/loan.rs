@@ -79,6 +79,7 @@ fn vouch_yield_bps_uncached(env: &Env, vouch: &VouchRecord, borrower: &Address, 
         .persistent()
         .get(&DataKey::VoucherStats(vouch.voucher.clone()));
     let voucher_rep_bonus = voucher_stats
+        .as_ref()
         .map(|s| (s.successful_vouches as i128 * 10).min(REPUTATION_BONUS_MAX_BPS))
         .unwrap_or(0);
 
@@ -1131,7 +1132,7 @@ pub fn set_loan_guarantor(
         return Err(ContractError::InvalidStateTransition);
     }
 
-    loan.guarantor = Some(guarantor);
+    loan.guarantor = Some(guarantor.clone());
 
     env.storage()
         .persistent()

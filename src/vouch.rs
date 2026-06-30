@@ -1137,7 +1137,7 @@ pub fn delegate_vouch(
         timestamp,
         modification_type: soroban_sdk::String::from_str(&env, "delegated"),
         stake_amount: vouch_rec.stake,
-        delegate: Some(delegate),
+        delegate: Some(delegate.clone()),
     });
 
     env.storage().persistent().set(

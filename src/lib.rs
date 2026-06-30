@@ -37,6 +37,7 @@ pub mod collateral_pool;
 pub mod gradual_unstake;
 /// Issue #887: Loan Subordination and Cascading Debt Hierarchy
 pub mod subordination;
+pub mod ipfs_archive;
 
 pub use errors::ContractError;
 pub use types::*;
@@ -136,7 +137,7 @@ use crate::helpers::{
     require_allowed_token, require_not_paused,
 };
 use crate::types::{AdminOperationType, Config, DataKey, MultiTierAdminThresholds, RateLimitConfig, DEFAULT_LOAN_DURATION, DEFAULT_MAX_LOAN_TO_STAKE_RATIO, DEFAULT_MAX_VOUCHERS, DEFAULT_MIN_LOAN_AMOUNT, DEFAULT_SLASH_BPS, DEFAULT_YIELD_BPS, DEFAULT_MIN_VOUCH_AGE_SECS};
-use soroban_sdk::BytesN;
+use soroban_sdk::{BytesN, Vec};
 
 #[contract]
 pub struct QuorumCreditContract;
@@ -900,6 +901,17 @@ impl QuorumCreditContract {
                     deadline,
                     loan_purpose: soroban_sdk::String::from_str(&env, "pool"),
                     token_address: cfg.token.clone(),
+        amortization_schedule: Vec::new(&env),
+        reminder_sent: false,
+        risk_score: 0,
+        deferment_periods: 0,
+        maturity_date: None,
+        rate_type: RateType::Fixed,
+        index_reference: None,
+        last_interest_calc: now,
+        accrued_interest: 0,
+        milestone_bonus_applied: false,
+        retry_count: 0,
                 },
             );
             env.storage()
@@ -1340,9 +1352,10 @@ impl QuorumCreditContract {
         env.storage().instance().set(&DataKey::Config, &cfg);
     }
 
-    pub fn add_allowed_token(env: Env, admin_signers: Vec<Address>, token: Address) {
-        admin::add_allowed_token(env, admin_signers, token)
-    }
+    pub fn add_allowed_token(env: Env, admin_signers: Vec<Address>, token: Address) -> Result<(), ContractError> {
+    admin::add_allowed_token(env, admin_signers, token)
+}
+
 
     pub fn remove_allowed_token(env: Env, admin_signers: Vec<Address>, token: Address) {
         admin::remove_allowed_token(env, admin_signers, token)
@@ -2094,7 +2107,6 @@ impl QuorumCreditContract {
     ) -> VouchPage {
         admin::get_vouches_paginated(env, borrower, cursor, page_size)
     }
-}
 
     // ── Issue #893: Multi-Tier Admin Approval ──────────────────────────────────
 
