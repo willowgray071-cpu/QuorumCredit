@@ -1,170 +1,27 @@
 #![no_std]
 
 pub mod admin;
-pub mod archive;
-pub mod attributes;
-pub mod batch_transfer;
-pub mod ipfs_archive;
-pub mod cache;
-pub mod collateral_pool;
 pub mod credit_score;
-pub mod cooldown_bypass;
-pub mod cross_chain;
-pub mod cross_chain_relay;
 pub mod errors;
-pub mod error_response;
 pub mod governance;
-pub mod gradual_unstake;
 pub mod helpers;
-pub mod insurance;
-pub mod lazy_slash;
 pub mod loan;
-pub mod merkle_tree;
-pub mod partial_repayment;
-pub mod periodic_payments;
 pub mod rbac;
 pub mod reputation;
-pub mod subordination;
-pub mod syndication;
 pub mod types;
-pub mod versioning;
 pub mod vouch;
-pub mod vouch_groups;
-pub mod yield_stream;
-/// Issue #887: Loan Subordination and Cascading Debt Hierarchy
-pub mod subordination;
-/// Issue #88: Liquidity Rebalancing — auto-rebalance collateral pools
-pub mod liquidity_rebalance;
 
 pub use errors::ContractError;
 pub use types::*;
-pub use cross_chain::{BridgeAttestation, BridgeAttestationPayload, CrossChainLoanMetadata, UnifiedReputation};
-pub use cross_chain_relay::{RelayAttestation, RelayEvent};
 
 #[cfg(test)]
-mod slash_threshold_voting_test;
-#[cfg(test)]
-mod slash_cooldown_test;
-#[cfg(test)]
-mod slash_voting_flow_test;
-#[cfg(test)]
-mod config_update_voting_test;
-#[cfg(test)]
-mod referral_test;
-#[cfg(test)]
-mod bug_condition_test;
-#[cfg(test)]
-mod coverage_test;
-#[cfg(test)]
-mod rbac_test;
-
-#[cfg(test)]
-mod emergency_pause_test;
-#[cfg(test)]
-mod withdrawal_queue_test;
-#[cfg(test)]
-mod cross_chain_vouch_test;
-#[cfg(test)]
-mod collateral_pool_cross_chain_test;
-#[cfg(test)]
-mod property_stake_loan_invariants_test;
-#[cfg(test)]
-mod emergency_admin_revocation_test;
-#[cfg(test)]
-mod credit_score_test;
-#[cfg(test)]
-mod syndication_test;
-#[cfg(test)]
-mod integration_scenarios;
-#[cfg(test)]
-mod integration_invariants;
-#[cfg(test)]
-mod integration_stress_test;
-#[cfg(test)]
-mod integration_regression_test;
-#[cfg(test)]
-mod governance_history_test;
-#[cfg(test)]
-mod slash_vote_cancel_test;
-#[cfg(test)]
-mod dynamic_quorum_adjustment_test;
-#[cfg(test)]
-mod conditional_vote_delegation_test;
-#[cfg(test)]
-mod ratio_enforcement_test;
-
-#[cfg(test)]
-mod risk_assessment_voting_test;
-#[cfg(test)]
-mod fee_structure_voting_test;
-#[cfg(test)]
-mod withdrawal_timelock_test;
-#[cfg(test)]
-mod cross_chain_proposal_sync_test;
-
-#[cfg(test)]
-mod proposal_metadata_test;
-#[cfg(test)]
-mod emergency_pause_auto_unpause_test;
-#[cfg(test)]
-mod governance_snapshot_test;
-#[cfg(test)]
-mod vote_escrow_lock_test;
-#[cfg(test)]
-mod loan_features_test;
-
-#[cfg(test)]
-mod co_borrower_test;
-
-#[cfg(test)]
-mod incremental_config_test;
-
-#[cfg(test)]
-mod storage_compaction_test;
-
-#[cfg(test)]
-mod vectorized_score_test;
-#[cfg(test)]
-mod zk_snarks_test;
-
-#[cfg(test)]
-mod query_pagination_test;
-#[cfg(test)]
-mod chaos_test;
-#[cfg(test)]
-mod dynamic_rate_test;
-#[cfg(test)]
-mod forbearance_test;
-#[cfg(test)]
-mod refinance_test;
-
-#[cfg(test)]
-mod incentives_verification_test;
-#[cfg(test)]
-mod regression_past_bugs_test;
-#[cfg(test)]
-mod batch_vouch_selective_rollback_test;
-
-#[cfg(test)]
-mod chaos_test;
-
-/// Issue #104: Event regression tests — event snapshots for critical transitions.
-#[cfg(test)]
-mod event_regression_test;
-
-/// Issue #105: Performance regression tests — gas/latency baselines.
-#[cfg(test)]
-mod gas_test;
-
-/// Issue #107: Specification tests — auto-generated from API spec.
-#[cfg(test)]
-mod spec_test;
+mod tests;
 
 use crate::helpers::{
     config, get_active_loan_record, has_active_loan, is_zero_address,
     loan_status as helper_loan_status, require_allowed_token, require_not_paused,
 };
-use crate::types::{AdminOperationType, CollateralPool, Config, DataKey, MultiTierAdminThresholds, RateLimitConfig, DEFAULT_LOAN_DURATION, DEFAULT_MAX_LOAN_TO_STAKE_RATIO, DEFAULT_MAX_VOUCHERS, DEFAULT_MIN_LOAN_AMOUNT, DEFAULT_SLASH_BPS, DEFAULT_YIELD_BPS, DEFAULT_MIN_VOUCH_AGE_SECS};
+use crate::types::{AdminOperationType, Config, DataKey, DEFAULT_LOAN_DURATION, DEFAULT_MAX_LOAN_TO_STAKE_RATIO, DEFAULT_MAX_VOUCHERS, DEFAULT_MIN_LOAN_AMOUNT, DEFAULT_SLASH_BPS, DEFAULT_YIELD_BPS, DEFAULT_MIN_VOUCH_AGE_SECS};
 use soroban_sdk::BytesN;
 
 #[contract]
