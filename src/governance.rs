@@ -72,9 +72,6 @@ pub fn get_effective_vote_stake(
     }
 }
 
-/// Default quorum: 50% of total vouched stake must approve.
-const DEFAULT_SLASH_VOTE_QUORUM_BPS: u32 = 5_000;
-
 /// Cast a governance vote on whether `borrower` should be slashed.
 ///
 /// - Only active vouchers (those with a stake in `Vouches(borrower)`) may vote.
@@ -192,6 +189,8 @@ pub fn vote_slash(
 
     let cfg = config(&env);
     let now = env.ledger().timestamp();
+
+    // Enforce slash cooldown (time since last *executed* slash).
     if cfg.slash_cooldown_seconds > 0 {
         if let Some(last) = env
             .storage()
@@ -275,6 +274,7 @@ pub fn vote_slash(
 
     if vote.executed {
         if has_active_loan(&env, &borrower) {
+            // This is a fresh loan — reset the vote record for the new proposal.
             vote = SlashVoteRecord {
                 approve_stake: 0,
                 reject_stake: 0,
@@ -322,23 +322,23 @@ pub fn vote_slash(
         env.storage()
             .persistent()
             .set(&DataKey::SlashVote(borrower.clone()), &vote);
-        
+
         // Instead of immediately executing, create a pending slash record
         let cfg = config(&env);
         let now = env.ledger().timestamp();
         let executable_at = now + cfg.slash_delay_seconds;
-        
+
         let pending_slash = PendingSlashRecord {
             borrower: borrower.clone(),
             approved_at: now,
             executable_at,
             executed: false,
         };
-        
+
         env.storage()
             .persistent()
             .set(&DataKey::PendingSlashExecution(borrower.clone()), &pending_slash);
-        
+
         env.events().publish(
             (symbol_short!("gov"), symbol_short!("slsh_pend")),
             (borrower.clone(), now, executable_at),
@@ -379,6 +379,7 @@ pub fn get_slash_vote_quorum(env: Env) -> u32 {
 
 /// Execute a slash vote if quorum has been met.
 /// Anyone can call this function to execute a slash once quorum is reached.
+/// Requires approximately 2/3 (6667 bps) of total vouched stake to have approved.
 pub fn execute_slash_vote(env: Env, borrower: Address) -> Result<(), ContractError> {
     require_not_paused(&env)?;
 
@@ -400,11 +401,20 @@ pub fn execute_slash_vote(env: Env, borrower: Address) -> Result<(), ContractErr
         .unwrap_or(Vec::new(&env));
     let total_stake: i128 = vouches.iter().map(|v| v.stake).sum();
 
-    // Retrieve quorum threshold
-    let quorum_bps: u32 = get_slash_vote_quorum(env.clone());
+    // Retrieve quorum threshold (default ≈ 66.67%)
+    let quorum_bps: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::SlashVoteQuorum)
+        .unwrap_or(DEFAULT_SLASH_VOTE_QUORUM_BPS);
 
-    // Calculate required quorum stake
-    let quorum_stake = total_stake * quorum_bps as i128 / 10_000;
+    // Calculate required quorum stake using ceiling division
+    let quorum_stake = (total_stake
+        .checked_mul(quorum_bps as i128)
+        .unwrap_or(i128::MAX)
+        .checked_add(BPS_DENOMINATOR - 1)
+        .unwrap_or(i128::MAX))
+        / BPS_DENOMINATOR;
 
     // Check if approval stake meets quorum
     if vote.approve_stake < quorum_stake {

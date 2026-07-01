@@ -104,6 +104,14 @@ pub const DEFAULT_LOAN_SIZE_SLASH_MAX_BPS: i128 = 8_000;
 /// Default borrower repayment confirmation requirement (false = disabled by default).
 pub const DEFAULT_CONFIRMATION_REQUIRED: bool = false;
 
+/// Default quorum for voucher-based slash votes, in basis points (6667 ≈ 66.67%).
+/// Requires approximately 2/3 of total vouched stake to approve before a slash executes.
+pub const DEFAULT_SLASH_VOTE_QUORUM_BPS: u32 = 6_667;
+
+/// Minimum elapsed time between successive slash proposals for the same borrower, in seconds
+/// (7 days). Prevents spam proposals and gives borrowers time to resolve issues between rounds.
+pub const DEFAULT_SLASH_PROPOSAL_COOLDOWN_SECS: u64 = 7 * 24 * 60 * 60;
+
 /// Default rate limit: 10 calls per window.
 pub const DEFAULT_RATE_LIMIT_COUNT: u32 = 10;
 /// Default rate limit window: 60 seconds.
@@ -413,6 +421,9 @@ pub enum DataKey {
     SlashThresholdProposalCounter,
     /// Per-borrower timestamp of the last successful slash.
     LastSlashedAt(Address),
+    /// Per-borrower timestamp of the most recent slash proposal initiation.
+    /// Used to enforce the 7-day cooldown between successive slash proposals.
+    LastSlashProposalAt(Address),
     /// Cached total weighted stake per borrower per token: (borrower, token) → i128
     /// Used for O(1) eligibility checks; invalidated on vouch operations.
     TotalWeightedStakeCache(Address, Address),
