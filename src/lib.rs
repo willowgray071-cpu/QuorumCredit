@@ -8,6 +8,7 @@ pub mod ipfs_archive;
 pub mod cache;
 pub mod collateral_pool;
 pub mod credit_score;
+pub mod cooldown_bypass;
 pub mod cross_chain;
 pub mod cross_chain_relay;
 pub mod errors;

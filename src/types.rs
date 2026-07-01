@@ -535,6 +535,8 @@ pub enum DataKey {
     // ── Issue #863: Vouch Cooldown Bypass ────────────────────────────────────
     /// Per-voucher emergency bypass flag: voucher → bool
     EmergencyCooldownBypass(Address),
+    /// Cooldown bypass request: (borrower, voucher) → CooldownBypassRequest
+    CooldownBypass(Address, Address),
     // ── Issue #867: Cross-Collateral Vouch Pools ─────────────────────────────
     CollateralPool(u64),
     CollateralPoolCounter,
