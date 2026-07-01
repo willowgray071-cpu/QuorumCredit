@@ -1,6 +1,6 @@
 use crate::errors::ContractError;
 use crate::types::{
-    Config, DataKey, LoanRecord, LoanStatus,
+    Config, DataKey, LoanRecord, LoanStatus, PauseMode, ThawState,
     MIN_DYNAMIC_SLASH_BPS, MAX_DYNAMIC_SLASH_BPS, HEALTH_THRESHOLD_BPS, BPS_DENOMINATOR,
 };
 use soroban_sdk::{token, Address, Env, String, Vec};
@@ -29,20 +29,75 @@ pub fn release_lock(env: &Env) {
 
 // ── Pause Check ───────────────────────────────────────────────────────────────
 
-pub fn require_not_paused(env: &Env) -> Result<(), ContractError> {
-    let paused: bool = env
+/// Returns the current [`PauseMode`], automatically transitioning from `Thawing`
+/// to `None` if the thaw window has expired.
+pub fn get_pause_mode(env: &Env) -> PauseMode {
+    let mode: PauseMode = env
         .storage()
         .instance()
-        .get(&DataKey::Paused)
-        .unwrap_or(false);
-    if paused {
-        return Err(ContractError::ContractPaused);
+        .get(&DataKey::PauseMode)
+        .unwrap_or(PauseMode::None);
+
+    if mode == PauseMode::Thawing {
+        // Auto-transition: if thaw window has elapsed, clear thaw state.
+        if let Some(thaw) = env
+            .storage()
+            .instance()
+            .get::<_, ThawState>(&DataKey::ThawState)
+        {
+            let now = env.ledger().timestamp();
+            if now >= thaw.thaw_start_timestamp + thaw.thaw_duration {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PauseMode, &PauseMode::None);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Paused, &false);
+                env.storage()
+                    .instance()
+                    .remove(&DataKey::ThawState);
+                return PauseMode::None;
+            }
+        }
     }
+
+    mode
+}
+
+/// Blocks all write operations when `Paused`, `Thawing`, or emergency-paused.
+/// This is the standard guard — call it in every state-mutating function.
+pub fn require_not_paused(env: &Env) -> Result<(), ContractError> {
     let cfg = config(env);
     if cfg.emergency_pause_enabled {
         return Err(ContractError::ContractPaused);
     }
-    Ok(())
+
+    match get_pause_mode(env) {
+        PauseMode::Paused => Err(ContractError::ContractPaused),
+        PauseMode::Thawing => Err(ContractError::ContractThawing),
+        PauseMode::None => Ok(()),
+    }
+}
+
+/// Lenient guard for read-friendly operations (e.g., `withdraw_vouch`).
+/// Blocks when `Paused` or emergency-paused, but passes through during `Thawing`.
+pub fn require_reads_allowed(env: &Env) -> Result<(), ContractError> {
+    let cfg = config(env);
+    if cfg.emergency_pause_enabled {
+        return Err(ContractError::ContractPaused);
+    }
+
+    match get_pause_mode(env) {
+        PauseMode::Paused => Err(ContractError::ContractPaused),
+        PauseMode::Thawing | PauseMode::None => Ok(()),
+    }
+}
+
+/// Alias kept for call-sites already updated to use the explicit thaw-blocking name.
+/// Identical to `require_not_paused`.
+#[inline]
+pub fn require_not_thawing(env: &Env) -> Result<(), ContractError> {
+    require_not_paused(env)
 }
 
 pub fn require_positive_amount(_env: &Env, amount: i128) -> Result<(), ContractError> {
@@ -129,6 +184,21 @@ pub fn add_slash_balance(env: &Env, amount: i128) {
     env.storage()
         .instance()
         .set(&DataKey::SlashTreasury, &(current + amount));
+}
+
+pub fn deduct_slash_balance(env: &Env, amount: i128) -> Result<(), crate::errors::ContractError> {
+    let current: i128 = env
+        .storage()
+        .instance()
+        .get(&DataKey::SlashTreasury)
+        .unwrap_or(0);
+    if current < amount {
+        return Err(crate::errors::ContractError::PoolInsufficientFunds);
+    }
+    env.storage()
+        .instance()
+        .set(&DataKey::SlashTreasury, &(current - amount));
+    Ok(())
 }
 
 pub fn is_zero_address(env: &Env, addr: &Address) -> bool {
@@ -241,6 +311,39 @@ pub fn require_admin_approval(env: &Env, admin_signers: &Vec<Address>) {
     }
 }
 
+/// Issue #893: Require admin approval for a specific operation type with multi-tier thresholds.
+/// Different operation types can require different numbers of approvals based on criticality.
+pub fn require_admin_approval_for_operation(
+    env: &Env,
+    admin_signers: &Vec<Address>,
+    operation_type: crate::types::AdminOperationType,
+) {
+    use crate::types::{AdminOperationType, DataKey};
+    
+    let cfg = config(env);
+    
+    // Determine the required threshold based on operation type
+    let required_threshold = if let Some(multi_tier) = &cfg.multi_tier_thresholds {
+        multi_tier.get_threshold(operation_type)
+    } else {
+        // Fall back to single threshold if multi-tier not configured
+        cfg.admin_threshold
+    };
+
+    assert!(
+        admin_signers.len() >= required_threshold,
+        "insufficient admin approvals for this operation type"
+    );
+
+    for signer in admin_signers.iter() {
+        assert!(
+            cfg.admins.iter().any(|a| a == signer),
+            "signer is not a registered admin"
+        );
+        signer.require_auth();
+    }
+}
+
 pub fn is_admin(env: &Env, addr: &Address) -> bool {
     config(env).admins.iter().any(|a| a == *addr)
 }
@@ -315,9 +418,8 @@ pub fn calculate_protocol_health_score(env: &Env) -> i128 {
     }
 
     // 30%: not paused
-    let paused: bool = env.storage().instance().get(&DataKey::Paused).unwrap_or(false);
     let cfg = config(env);
-    if !paused && !cfg.emergency_pause_enabled {
+    if get_pause_mode(env) == PauseMode::None && !cfg.emergency_pause_enabled {
         score += 3_000;
     }
 
@@ -403,5 +505,117 @@ pub fn check_permission(
         Ok(())
     } else {
         Err(ContractError::PermissionDenied)
+    }
+}
+
+// ── Issue #63: Signature Replay Protection ────────────────────────────────────
+
+/// Verifies `nonce` is strictly greater than the last consumed nonce for `caller`,
+/// then records it. Returns `Err(ReplayAttackDetected)` if the nonce has already
+/// been consumed.
+///
+/// Callers must include `nonce` in the signed payload to prevent replays.
+pub fn verify_and_consume_nonce(
+    env: &Env,
+    caller: &Address,
+    nonce: u64,
+) -> Result<(), ContractError> {
+    let last: u64 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Nonce(caller.clone()))
+        .unwrap_or(0);
+    if nonce <= last {
+        return Err(ContractError::ReplayAttackDetected);
+    }
+    env.storage()
+        .persistent()
+        .set(&DataKey::Nonce(caller.clone()), &nonce);
+    Ok(())
+}
+
+/// Returns the next expected nonce for `caller` (last consumed + 1).
+pub fn next_nonce(env: &Env, caller: &Address) -> u64 {
+    let last: u64 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Nonce(caller.clone()))
+        .unwrap_or(0);
+    last + 1
+}
+
+// ── Issue #64: Oracle Price Staleness ─────────────────────────────────────────
+
+/// Validates that an oracle price record is fresh (within `ORACLE_PRICE_MAX_AGE_SECS`).
+/// Returns `Err(AttestationExpired)` if the price is stale.
+pub fn validate_price_freshness(
+    env: &Env,
+    price_record: &crate::types::OraclePriceRecord,
+) -> Result<(), ContractError> {
+    let now = env.ledger().timestamp();
+    if now.saturating_sub(price_record.recorded_at) > crate::types::ORACLE_PRICE_MAX_AGE_SECS {
+        return Err(ContractError::AttestationExpired);
+    }
+    Ok(())
+}
+
+/// Retrieves an oracle price record and validates its freshness in one call.
+pub fn get_fresh_price(
+    env: &Env,
+    key: soroban_sdk::Symbol,
+) -> Result<crate::types::OraclePriceRecord, ContractError> {
+    let record: crate::types::OraclePriceRecord = env
+        .storage()
+        .persistent()
+        .get(&DataKey::OraclePrice(key))
+        .ok_or(ContractError::OracleUnauthorized)?;
+    validate_price_freshness(env, &record)?;
+    Ok(record)
+}
+
+// ── Issue #65: Graduated Response / Tiered Lockdown ───────────────────────────
+
+/// Returns the current [`ThreatLevel`] (defaults to `Normal`).
+pub fn get_threat_level(env: &Env) -> crate::types::ThreatLevel {
+    env.storage()
+        .persistent()
+        .get(&DataKey::ThreatLevelKey)
+        .unwrap_or(crate::types::ThreatLevel::Normal)
+}
+
+/// Sets the protocol threat level. Requires admin approval.
+pub fn set_threat_level(
+    env: &Env,
+    admin_signers: &soroban_sdk::Vec<Address>,
+    level: crate::types::ThreatLevel,
+) {
+    require_admin_approval(env, admin_signers);
+    env.storage()
+        .persistent()
+        .set(&DataKey::ThreatLevelKey, &level);
+}
+
+/// Enforces graduated response restrictions for a write operation.
+///
+/// - `Normal`   → allowed
+/// - `Elevated` → blocks new vouches/loans (callers pass `is_new_activity = true`)
+/// - `Critical` → blocks all writes
+/// - `Lockdown` → blocks all writes
+pub fn require_graduated_response(
+    env: &Env,
+    is_new_activity: bool,
+) -> Result<(), ContractError> {
+    match get_threat_level(env) {
+        crate::types::ThreatLevel::Normal => Ok(()),
+        crate::types::ThreatLevel::Elevated => {
+            if is_new_activity {
+                Err(ContractError::ContractPaused)
+            } else {
+                Ok(())
+            }
+        }
+        crate::types::ThreatLevel::Critical | crate::types::ThreatLevel::Lockdown => {
+            Err(ContractError::ContractPaused)
+        }
     }
 }

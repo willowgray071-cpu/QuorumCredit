@@ -1,11 +1,13 @@
 """QuorumCredit Python SDK for Stellar Soroban."""
 
 from .client import (
-    QuorumCreditClient,
     ClientConfig,
+    QuorumCreditClient,
     LoanRecord,
     VouchRecord,
     Config,
+    xlm_to_stroops,
+    stroops_to_xlm,
 )
 
 __version__ = "1.0.0"
@@ -15,4 +17,6 @@ __all__ = [
     "LoanRecord",
     "VouchRecord",
     "Config",
+    "xlm_to_stroops",
+    "stroops_to_xlm",
 ]

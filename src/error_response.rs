@@ -120,10 +120,35 @@ pub fn error_to_response(env: &Env, error: ContractError) -> ErrorResponse {
             "Loan below minimum amount",
             Some("Requested loan amount is below the configured minimum"),
         ),
+        ContractError::RefinanceNoOutstanding => (
+            143,
+            "Refinance has no outstanding balance",
+            Some("The existing loan has no outstanding principal or yield to refinance"),
+        ),
         ContractError::QuorumNotMet => (
             35,
             "Quorum not met",
             Some("Insufficient votes to execute the proposal"),
+        ),
+        ContractError::AppealNotFound => (
+            127,
+            "Appeal not found",
+            Some("No slash escrow or appeal exists for this borrower"),
+        ),
+        ContractError::AppealAlreadyVoted => (
+            128,
+            "Appeal already voted",
+            Some("Voucher has already voted on this appeal"),
+        ),
+        ContractError::AppealQuorumNotMet => (
+            129,
+            "Appeal quorum not met",
+            Some("2/3 quorum not reached to overturn the slash"),
+        ),
+        ContractError::EscrowExpired => (
+            130,
+            "Escrow expired",
+            Some("Escrow period has expired; appeal can no longer be filed or voted on"),
         ),
         _ => (
             255,
