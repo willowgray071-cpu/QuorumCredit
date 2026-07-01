@@ -2554,3 +2554,25 @@ impl QuorumCreditContract {
         vouch::get_bridges(env)
     }
 }
+
+impl LoanRecord {
+    pub fn get_next_expected_payment(&self) -> i128 {
+        // Linear amortization: amount / periods
+        self.amount / self.num_periods as i128
+    }
+}
+
+pub fn validate_repayment_amount(loan: &LoanRecord, payment: i128) -> bool {
+    payment >= loan.get_next_expected_payment()
+}
+
+pub fn repay(e: Env, borrower: Address, payment: i128) -> Result<(), ContractError> {
+    let mut loan = get_loan(&e, &borrower)?;
+    
+    if !validate_repayment_amount(&loan, payment) {
+        return Err(ContractError::InsufficientRepayment);
+    }
+    
+    // Proceed with existing repayment logic...
+    Ok(())
+}
