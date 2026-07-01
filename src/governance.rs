@@ -1,23 +1,172 @@
-﻿use crate::errors::ContractError;
+use crate::errors::ContractError;
 use crate::helpers::{
     add_slash_balance, config, get_active_loan_record, get_latest_loan_record, has_active_loan,
-    require_admin_approval, require_governance_participant, require_not_paused,
+    is_zero_address, require_admin_approval, require_governance_participant, require_not_paused,
 };
 use crate::types::{
-    AppealStatus, DataKey, LoanStatus, PendingSlashRecord, SlashEscrowAppealRecord, SlashEscrow,
-    SlashRecord, SlashThresholdProposal, SlashVoteRecord, TimelockAction, TimelockProposal,
-    VouchRecord, BPS_DENOMINATOR, APPEAL_OVERRIDE_QUORUM_BPS, SLASH_APPEAL_PERIOD,
+    AdminRemovalProposal, AppealStatus, DataKey, LoanStatus, PendingSlashRecord,
+    SlashAppealRecord, SlashEscrowAppealRecord, SlashEscrow,
+    SlashingReportRecord, SlashRecord, SlashThresholdProposal, SlashVoteRecord,
+    TimelockAction, TimelockProposal,
+    VouchRecord, BPS_DENOMINATOR, APPEAL_OVERRIDE_QUORUM_BPS, MONTHLY_PERIOD_SECS,
+    SLASH_APPEAL_PERIOD,
 };
-use soroban_sdk::{panic_with_error, symbol_short, Address, Env, Vec};
+use soroban_sdk::{panic_with_error, symbol_short, Address, Env, String, Vec};
 
-/// Default quorum: 50% of total vouched stake must approve.
-const DEFAULT_SLASH_VOTE_QUORUM_BPS: u32 = 5_000;
+/// Issue #1069: Resolve the effective voter for a voucher, following delegation chain.
+/// Returns the final delegate if one exists, otherwise the original voucher.
+pub fn resolve_vote_delegation(env: &Env, voucher: &Address) -> Address {
+    let mut current = voucher.clone();
+    let mut visited: Vec<Address> = Vec::new(env);
+    visited.push_back(current.clone());
+    
+    // Follow delegation chain (max 10 hops to prevent infinite loops)
+    for _ in 0..10 {
+        if let Some(delegate) = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VoteDelegation(current.clone()))
+        {
+            // Check for circular delegation
+            if visited.iter().any(|a| a == &delegate) {
+                break;
+            }
+            current = delegate;
+            visited.push_back(current.clone());
+        } else {
+            break;
+        }
+    }
+    
+    current
+}
+
+/// Issue #1069: Get the effective stake for a voucher, considering delegation.
+/// If the voucher has delegated their vote, returns 0 (delegate votes with their own stake).
+/// Otherwise returns the voucher's actual stake.
+pub fn get_effective_vote_stake(
+    env: &Env,
+    voucher: &Address,
+    borrower: &Address,
+) -> Result<i128, ContractError> {
+    let vouches: Vec<VouchRecord> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Vouches(borrower.clone()))
+        .unwrap_or(Vec::new(env));
+    
+    let vouch_rec = vouches
+        .iter()
+        .find(|v| v.voucher == *voucher)
+        .ok_or(ContractError::VoucherNotFound)?;
+    
+    // Check if this voucher has delegated their vote
+    let effective_voter = resolve_vote_delegation(env, voucher);
+    
+    // If the effective voter is different from this voucher, this voucher's stake
+    // is counted under the delegate's vote, not their own
+    if effective_voter != *voucher {
+        Ok(0)
+    } else {
+        Ok(vouch_rec.stake)
+    }
+}
 
 /// Cast a governance vote on whether `borrower` should be slashed.
 ///
 /// - Only active vouchers (those with a stake in `Vouches(borrower)`) may vote.
 /// - Votes are weighted by the voucher's current stake.
 /// - When `approve_stake * BPS_DENOMINATOR / total_stake >= quorum_bps`, slash is auto-executed.
+/// Issue #1069: Delegate vote to another address for governance votes.
+/// The delegate can vote on behalf of the voucher with the voucher's stake.
+pub fn delegate_vote(
+    env: Env,
+    voucher: Address,
+    delegate: Address,
+) -> Result<(), ContractError> {
+    voucher.require_auth();
+    require_not_paused(&env)?;
+
+    if voucher == delegate {
+        return Err(ContractError::InvalidStateTransition);
+    }
+
+    // Check for circular delegation
+    let mut visited: Vec<Address> = Vec::new(&env);
+    visited.push_back(voucher.clone());
+    
+    let mut current = delegate.clone();
+    for _ in 0..10 {
+        if current == voucher {
+            return Err(ContractError::CircularDelegation);
+        }
+        
+        if let Some(next_delegate) = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VoteDelegation(current.clone()))
+        {
+            if visited.iter().any(|a| a == &next_delegate) {
+                break;
+            }
+            visited.push_back(next_delegate.clone());
+            current = next_delegate;
+        } else {
+            break;
+        }
+    }
+
+    // Store the delegation
+    env.storage()
+        .persistent()
+        .set(&DataKey::VoteDelegation(voucher.clone()), &delegate);
+
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("delegated")),
+        (voucher, delegate),
+    );
+
+    Ok(())
+}
+
+/// Issue #1069: Revoke a previously delegated vote.
+pub fn revoke_vote_delegation(
+    env: Env,
+    voucher: Address,
+) -> Result<(), ContractError> {
+    voucher.require_auth();
+    require_not_paused(&env)?;
+
+    // Check if delegation exists
+    if env
+        .storage()
+        .persistent()
+        .get::<DataKey, Address>(&DataKey::VoteDelegation(voucher.clone()))
+        .is_none()
+    {
+        return Err(ContractError::DelegationNotFound);
+    }
+
+    // Remove the delegation
+    env.storage()
+        .persistent()
+        .remove(&DataKey::VoteDelegation(voucher.clone()));
+
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("revoked")),
+        (voucher,),
+    );
+
+    Ok(())
+}
+
+/// Issue #1069: Get the delegate for a voucher, if any.
+pub fn get_vote_delegate(env: Env, voucher: Address) -> Option<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::VoteDelegation(voucher))
+}
+
 pub fn vote_slash(
     env: Env,
     voucher: Address,
@@ -40,6 +189,8 @@ pub fn vote_slash(
 
     let cfg = config(&env);
     let now = env.ledger().timestamp();
+
+    // Enforce slash cooldown (time since last *executed* slash).
     if cfg.slash_cooldown_seconds > 0 {
         if let Some(last) = env
             .storage()
@@ -73,13 +224,41 @@ pub fn vote_slash(
         .get(&DataKey::Vouches(borrower.clone()))
         .unwrap_or(Vec::new(&env));
 
+    // Issue #1069: Resolve delegation - if this voucher has delegated, the delegate votes with this stake
+    let effective_voter = resolve_vote_delegation(&env, &voucher);
+    let actual_voter = if effective_voter != voucher {
+        // This voucher's stake is counted under the delegate's vote
+        // The delegate should call vote_slash separately
+        return Ok(()); // Silently succeed - delegate will vote
+    } else {
+        voucher.clone()
+    };
+
     let voucher_stake = vouches
         .iter()
-        .find(|v| v.voucher == voucher)
+        .find(|v| v.voucher == actual_voter)
         .map(|v| v.stake)
         .ok_or(ContractError::VoucherNotFound)?;
 
-    let total_stake: i128 = vouches.iter().map(|v| v.stake).sum();
+    // Issue #1069: Calculate total stake including delegated votes
+    // For each delegate, sum up their own stake plus all delegated stakes
+    let mut total_stake: i128 = 0;
+    let mut effective_stake: i128 = voucher_stake;
+    
+    for v in vouches.iter() {
+        let voter = resolve_vote_delegation(&env, &v.voucher);
+        if voter == v.voucher {
+            // This voucher votes for themselves
+            total_stake += v.stake;
+        } else if voter == actual_voter {
+            // This voucher's stake is delegated to the actual voter
+            effective_stake += v.stake;
+            total_stake += v.stake;
+        } else {
+            // Delegated to someone else, still counts in total
+            total_stake += v.stake;
+        }
+    }
 
     // Load or initialise the vote record.
     let mut vote: SlashVoteRecord = env
@@ -95,6 +274,7 @@ pub fn vote_slash(
 
     if vote.executed {
         if has_active_loan(&env, &borrower) {
+            // This is a fresh loan — reset the vote record for the new proposal.
             vote = SlashVoteRecord {
                 approve_stake: 0,
                 reject_stake: 0,
@@ -106,31 +286,31 @@ pub fn vote_slash(
         }
     }
 
-    // Prevent double-voting.
-    if vote.voters.iter().any(|v| v == voucher) {
+    // Prevent double-voting by the effective voter.
+    if vote.voters.iter().any(|v| resolve_vote_delegation(&env, v) == actual_voter) {
         return Err(ContractError::AlreadyVoted);
     }
 
     if approve {
-        vote.approve_stake = vote.approve_stake.checked_add(voucher_stake).ok_or(ContractError::ArithmeticError)?;
+        vote.approve_stake = vote.approve_stake.checked_add(effective_stake).ok_or(ContractError::ArithmeticError)?;
     } else {
-        vote.reject_stake = vote.reject_stake.checked_add(voucher_stake).ok_or(ContractError::ArithmeticError)?;
+        vote.reject_stake = vote.reject_stake.checked_add(effective_stake).ok_or(ContractError::ArithmeticError)?;
     }
-    vote.voters.push_back(voucher.clone());
+    vote.voters.push_back(actual_voter.clone());
 
     env.events().publish(
         (symbol_short!("gov"), symbol_short!("voted")),
-        (voucher.clone(), borrower.clone(), approve, voucher_stake),
+        (actual_voter.clone(), borrower.clone(), approve, effective_stake),
     );
 
-    // Check quorum.
+    // Check quorum using the effective total stake.
     let quorum_bps: u32 = env
         .storage()
         .instance()
         .get(&DataKey::SlashVoteQuorum)
         .unwrap_or(DEFAULT_SLASH_VOTE_QUORUM_BPS);
 
-    // Use ceiling division to prevent rounding down: (approve_stake * BPS_DENOMINATOR + total_stake - 1) / total_stake
+    // Use ceiling division to prevent rounding down
     let quorum_reached = total_stake > 0
         && (vote.approve_stake.checked_mul(BPS_DENOMINATOR).ok_or(ContractError::ArithmeticError)?
             .checked_add(total_stake).ok_or(ContractError::ArithmeticError)?
@@ -142,23 +322,23 @@ pub fn vote_slash(
         env.storage()
             .persistent()
             .set(&DataKey::SlashVote(borrower.clone()), &vote);
-        
+
         // Instead of immediately executing, create a pending slash record
         let cfg = config(&env);
         let now = env.ledger().timestamp();
         let executable_at = now + cfg.slash_delay_seconds;
-        
+
         let pending_slash = PendingSlashRecord {
             borrower: borrower.clone(),
             approved_at: now,
             executable_at,
             executed: false,
         };
-        
+
         env.storage()
             .persistent()
             .set(&DataKey::PendingSlashExecution(borrower.clone()), &pending_slash);
-        
+
         env.events().publish(
             (symbol_short!("gov"), symbol_short!("slsh_pend")),
             (borrower.clone(), now, executable_at),
@@ -199,6 +379,7 @@ pub fn get_slash_vote_quorum(env: Env) -> u32 {
 
 /// Execute a slash vote if quorum has been met.
 /// Anyone can call this function to execute a slash once quorum is reached.
+/// Requires approximately 2/3 (6667 bps) of total vouched stake to have approved.
 pub fn execute_slash_vote(env: Env, borrower: Address) -> Result<(), ContractError> {
     require_not_paused(&env)?;
 
@@ -220,11 +401,20 @@ pub fn execute_slash_vote(env: Env, borrower: Address) -> Result<(), ContractErr
         .unwrap_or(Vec::new(&env));
     let total_stake: i128 = vouches.iter().map(|v| v.stake).sum();
 
-    // Retrieve quorum threshold
-    let quorum_bps: u32 = get_slash_vote_quorum(env.clone());
+    // Retrieve quorum threshold (default ≈ 66.67%)
+    let quorum_bps: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::SlashVoteQuorum)
+        .unwrap_or(DEFAULT_SLASH_VOTE_QUORUM_BPS);
 
-    // Calculate required quorum stake
-    let quorum_stake = total_stake * quorum_bps as i128 / 10_000;
+    // Calculate required quorum stake using ceiling division
+    let quorum_stake = (total_stake
+        .checked_mul(quorum_bps as i128)
+        .unwrap_or(i128::MAX)
+        .checked_add(BPS_DENOMINATOR - 1)
+        .unwrap_or(i128::MAX))
+        / BPS_DENOMINATOR;
 
     // Check if approval stake meets quorum
     if vote.approve_stake < quorum_stake {
@@ -402,6 +592,11 @@ fn execute_slash(env: &Env, borrower: &Address) -> Result<(), ContractError> {
 
     for v in vouches.iter() {
         if v.token != loan.token_address {
+            // Return non-matching-token vouches in full to their owner.
+            if !is_zero_address(env, &v.token) {
+                let other_token = soroban_sdk::token::Client::new(env, &v.token);
+                other_token.transfer(&env.current_contract_address(), &v.voucher, &v.stake);
+            }
             remaining_vouches.push_back(v);
             continue;
         }
@@ -512,7 +707,7 @@ fn execute_slash(env: &Env, borrower: &Address) -> Result<(), ContractError> {
 /// Queue a slash operation for deferred batch execution (Issue #937: Lazy Slash).
 /// This allows multiple slashes to be batched together, reducing gas costs.
 pub fn queue_slash(env: Env, borrower: Address, slash_amount: i128) -> Result<(), ContractError> {
-    require_admin_approval(env.clone(), &env.current_contract_address(), &vec![env.current_contract_address()])?;
+    require_admin_approval(&env, &Vec::new(&env));
     
     // Calculate slash amount from existing vouch stake if not provided
     let actual_slash = if slash_amount > 0 {
@@ -532,7 +727,7 @@ pub fn queue_slash(env: Env, borrower: Address, slash_amount: i128) -> Result<()
     crate::lazy_slash::queue_slash(&env, borrower.clone(), actual_slash)?;
     
     env.events().publish(
-        (symbol_short!("gov"), symbol_short!("slash_queued")),
+        (symbol_short!("gov"), symbol_short!("slashqd")),
         (borrower.clone(), actual_slash),
     );
     
@@ -542,12 +737,12 @@ pub fn queue_slash(env: Env, borrower: Address, slash_amount: i128) -> Result<()
 /// Execute all queued slash operations in a single batch (Issue #937: Lazy Slash).
 /// Returns the number of slashes executed.
 pub fn execute_queued_slashes(env: Env) -> Result<u32, ContractError> {
-    require_admin_approval(env.clone(), &env.current_contract_address(), &vec![env.current_contract_address()])?;
+    require_admin_approval(&env, &Vec::new(&env));
     
     let executed = crate::lazy_slash::execute_queued_slashes(&env)?;
     
     env.events().publish(
-        (symbol_short!("gov"), symbol_short!("slash_queue_executed")),
+        (symbol_short!("gov"), symbol_short!("slashqexc")),
         (executed,),
     );
     
@@ -1349,7 +1544,7 @@ pub fn vote_appeal(
         .ok_or(ContractError::AppealNotFound)?;
 
     // Prevent double voting
-    if appeal.voters.iter().any(|v| v == &voucher) {
+    if appeal.voters.iter().any(|v| v == voucher) {
         return Err(ContractError::AppealAlreadyVoted);
     }
 
@@ -1806,7 +2001,7 @@ pub fn initiate_cross_chain_sync(
     source_chain: String,
     target_chains: Vec<String>,
     proposal_type: String,
-    proposal_data: Vec<u8>,
+    proposal_data: soroban_sdk::Bytes,
 ) -> Result<u64, ContractError> {
     proposer.require_auth();
     require_not_paused(&env)?;
@@ -1891,6 +2086,130 @@ pub fn vote_cross_chain_sync(
     env.events().publish(
         (symbol_short!("xchain"), symbol_short!("voted")),
         (sync_id, chain_id, approve),
+    );
+
+    Ok(())
+}
+
+pub fn propose_config_change(
+    env: Env,
+    proposer: Address,
+    new_config: crate::types::Config,
+) -> Result<u64, ContractError> {
+    proposer.require_auth();
+    require_not_paused(&env)?;
+    let cfg = config(&env);
+    assert!(
+        cfg.admins.iter().any(|a| a == &proposer),
+        "only admins can propose config changes"
+    );
+
+    let proposal_id: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::TimelockCounter)
+        .unwrap_or(0u64)
+        .checked_add(1)
+        .expect("proposal ID overflow");
+
+    let eta = env.ledger().timestamp() + crate::types::CONFIG_TIMELOCK_SECONDS;
+
+    let proposal = TimelockProposal {
+        id: proposal_id,
+        action: TimelockAction::SetConfig(new_config),
+        proposer: proposer.clone(),
+        eta,
+        executed: false,
+        cancelled: false,
+    };
+
+    env.storage()
+        .instance()
+        .set(&DataKey::Timelock(proposal_id), &proposal);
+    env.storage()
+        .instance()
+        .set(&DataKey::TimelockCounter, &proposal_id);
+
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("config_prop")),
+        (proposal_id, proposer, eta),
+    );
+
+    Ok(proposal_id)
+}
+
+pub fn execute_config_change(env: Env, proposal_id: u64) -> Result<(), ContractError> {
+    require_not_paused(&env)?;
+
+    let mut proposal: TimelockProposal = env
+        .storage()
+        .instance()
+        .get(&DataKey::Timelock(proposal_id))
+        .ok_or(ContractError::ProposalNotFound)?;
+
+    if proposal.executed {
+        return Err(ContractError::SlashAlreadyExecuted);
+    }
+    if proposal.cancelled {
+        return Err(ContractError::ProposalNotFound);
+    }
+
+    if env.ledger().timestamp() < proposal.eta {
+        return Err(ContractError::ProposalNotFound);
+    }
+
+    const TIMELOCK_EXPIRY: u64 = 72 * 60 * 60;
+    if env.ledger().timestamp() > proposal.eta + TIMELOCK_EXPIRY {
+        return Err(ContractError::ProposalNotFound);
+    }
+
+    if let TimelockAction::SetConfig(new_config) = &proposal.action {
+        proposal.executed = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::Timelock(proposal_id), &proposal);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Config, new_config);
+
+        env.events().publish(
+            (symbol_short!("gov"), symbol_short!("config_exec")),
+            (proposal_id,),
+        );
+
+        Ok(())
+    } else {
+        Err(ContractError::ProposalNotFound)
+    }
+}
+
+pub fn cancel_config_change(
+    env: Env,
+    admin_signers: Vec<Address>,
+    proposal_id: u64,
+) -> Result<(), ContractError> {
+    require_not_paused(&env)?;
+    crate::helpers::require_admin_approval(&env, &admin_signers);
+
+    let mut proposal: TimelockProposal = env
+        .storage()
+        .instance()
+        .get(&DataKey::Timelock(proposal_id))
+        .ok_or(ContractError::ProposalNotFound)?;
+
+    if proposal.executed || proposal.cancelled {
+        return Err(ContractError::SlashAlreadyExecuted);
+    }
+
+    proposal.cancelled = true;
+    env.storage()
+        .instance()
+        .set(&DataKey::Timelock(proposal_id), &proposal);
+
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("config_cancel")),
+        (proposal_id,),
     );
 
     Ok(())
