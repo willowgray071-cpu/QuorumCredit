@@ -10,7 +10,7 @@ use crate::types::{
     BorrowerDynamicRate, DataKey, DynamicRateConfig, EscrowStatus,
     ForbearanceRecord, ForbearanceStatus, LoanRecord, LoanStatus, LoanStatusEx,
     RefinanceRecord, SlashRecord, VouchRecord, VoucherStats,
-    YieldDistributionEntry,
+    YieldDistributionEntry, PaymentRecord,
     BPS_DENOMINATOR, DEFAULT_DYNAMIC_RATE_CONFIG, DEFAULT_FORBEARANCE_DURATION_SECS,
     MAX_FORBEARANCE_PERIODS, REPUTATION_BONUS_MAX_BPS, SLASH_ESCROW_PERIOD,
 };
@@ -390,6 +390,22 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
     loan.amount_repaid = loan.amount_repaid.checked_add(payment).ok_or(ContractError::ArithmeticError)?;
 
     let now = env.ledger().timestamp();
+    
+    // Track this payment in PaymentHistory for credit score timeliness calculation
+    let mut payment_history: Vec<PaymentRecord> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::PaymentHistory(loan.id))
+        .unwrap_or(Vec::new(&env));
+    payment_history.push_back(PaymentRecord {
+        amount: payment,
+        timestamp: now,
+        cumulative_repaid: loan.amount_repaid,
+    });
+    env.storage()
+        .persistent()
+        .set(&DataKey::PaymentHistory(loan.id), &payment_history);
+    
     let cfg = config(&env);
 
     let mut penalty: i128 = 0;
