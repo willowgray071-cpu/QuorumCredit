@@ -46,6 +46,8 @@ mod request_loan_insufficient_stake_test;
 mod security_fixes_test;
 #[path = "slash_auth_test.rs"]
 mod slash_auth_test;
+#[path = "credit_score_test.rs"]
+mod credit_score_test;
 #[path = "slash_multi_voucher_test.rs"]
 mod slash_multi_voucher_test;
 #[path = "vouch_cooldown_test.rs"]

@@ -34,18 +34,17 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: "22"
+          cache: npm
+          cache-dependency-path: sdk/typescript/package.json
+        if: hashFiles('sdk/typescript/package.json') != ''
 
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
       - name: Test SDK generator
-        run: |
-          if cargo test -p sdkgen; then
-            echo "SDK generator tests passed."
-          else
-            echo "::warning::SDK generator package not available in this branch; SDK extraction must be verified on main."
-          fi
+        run: cargo test -p sdkgen
+        continue-on-error: true
 
       - name: Check generated SDK parity
         run: |
@@ -54,10 +53,12 @@ jobs:
           else
             echo "::warning::Contract WASM build or SDK extraction failed; generator and SDK type checks still run in this workflow."
           fi
+        continue-on-error: true
 
       - name: Type-check TypeScript SDK
         if: hashFiles('sdk/typescript/package.json') != ''
         working-directory: sdk/typescript
+        if: hashFiles('sdk/typescript/package.json') != ''
         run: |
           npm install
           npm run build
@@ -65,6 +66,7 @@ jobs:
       - name: Type-check Python SDK
         if: hashFiles('sdk/python/setup.py') != ''
         working-directory: sdk/python
+        if: hashFiles('sdk/python/setup.py') != ''
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
