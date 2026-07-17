@@ -2,7 +2,7 @@ use crate::errors::ContractError;
 use crate::helpers::config;
 use crate::types::{
     CreditFactors, CreditScore, CreditScoreConfig, CreditTier, DataKey, TierRewards,
-    DEFAULT_CREDIT_SCORE_CONFIG,
+    DEFAULT_CREDIT_SCORE_CONFIG, LoanRecord, LoanStatus,
 };
 use soroban_sdk::{panic_with_error, symbol_short, Address, Env, Vec};
 
@@ -90,6 +90,102 @@ pub fn calculate_timeliness_score(avg_repayment_time: i64) -> u32 {
     }
 }
 
+/// Helper: Calculate total borrowed amount across all borrower's loans.
+fn calculate_total_borrowed(env: &Env, borrower: &Address) -> i128 {
+    let _total_loans: u32 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::LoanCount(borrower.clone()))
+        .unwrap_or(0);
+    
+    let mut total: i128 = 0;
+    let counter: u64 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::LoanCounter)
+        .unwrap_or(0);
+    
+    for loan_id in 1..=counter {
+        if let Some(loan) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, LoanRecord>(&DataKey::Loan(loan_id))
+        {
+            if loan.borrower == *borrower {
+                total = total.saturating_add(loan.amount);
+            }
+        }
+    }
+    
+    total
+}
+
+/// Helper: Calculate total repaid amount across all borrower's loans.
+fn calculate_total_repaid(env: &Env, borrower: &Address) -> i128 {
+    let _total_loans: u32 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::LoanCount(borrower.clone()))
+        .unwrap_or(0);
+    
+    let mut total: i128 = 0;
+    let counter: u64 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::LoanCounter)
+        .unwrap_or(0);
+    
+    for loan_id in 1..=counter {
+        if let Some(loan) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, LoanRecord>(&DataKey::Loan(loan_id))
+        {
+            if loan.borrower == *borrower {
+                total = total.saturating_add(loan.amount_repaid);
+            }
+        }
+    }
+    
+    total
+}
+
+/// Helper: Calculate average repayment time (in seconds relative to deadline) across fully-repaid loans.
+/// Returns positive value if repaid early (average time before deadline), negative if late.
+fn calculate_avg_repayment_time(env: &Env, borrower: &Address) -> i64 {
+    let counter: u64 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::LoanCounter)
+        .unwrap_or(0);
+    
+    let mut repayment_times: Vec<i64> = Vec::new(env);
+    
+    for loan_id in 1..=counter {
+        if let Some(loan) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, LoanRecord>(&DataKey::Loan(loan_id))
+        {
+            if loan.borrower == *borrower && loan.status == LoanStatus::Repaid {
+                if let Some(repayment_ts) = loan.repayment_timestamp {
+                    // Calculate time to repayment relative to deadline
+                    // Positive = early (repaid before deadline), Negative = late
+                    let time_vs_deadline = (loan.deadline as i64) - (repayment_ts as i64);
+                    repayment_times.push_back(time_vs_deadline);
+                }
+            }
+        }
+    }
+    
+    if repayment_times.len() == 0 {
+        return 0; // No repaid loans, neutral timeliness
+    }
+    
+    let sum: i64 = repayment_times.iter().sum();
+    sum / repayment_times.len() as i64
+}
+
 /// Calculate overall credit score based on factors.
 pub fn calculate_credit_score(
     env: &Env,
@@ -142,7 +238,10 @@ pub fn calculate_credit_score(
     let loan_count_score = calculate_loan_count_score(total_loans);
     let account_age_score = calculate_account_age_score(account_age);
     let vouching_score = calculate_vouching_score(voucher_count);
-    let timeliness_score = calculate_timeliness_score(0); // Default to neutral
+    
+    // Calculate real timeliness from actual repayment history
+    let avg_repayment_time_secs = calculate_avg_repayment_time(env, borrower);
+    let timeliness_score = calculate_timeliness_score(avg_repayment_time_secs);
 
     // Weighted average
     let weighted_score = (repayment_history_score as u64 * factors.repayment_history_weight as u64
@@ -154,6 +253,10 @@ pub fn calculate_credit_score(
 
     let score = weighted_score as u32;
     let tier = calculate_tier(score);
+    
+    // Calculate real aggregates from borrower's loan history
+    let total_borrowed = calculate_total_borrowed(env, borrower);
+    let total_repaid = calculate_total_repaid(env, borrower);
 
     let credit_score = CreditScore {
         score,
@@ -162,11 +265,11 @@ pub fn calculate_credit_score(
         total_loans,
         successful_repayments,
         defaults,
-        total_borrowed: 0, // Would need to track this
-        total_repaid: 0,    // Would need to track this
+        total_borrowed,
+        total_repaid,
         account_age,
         voucher_count,
-        avg_repayment_time: 0, // Would need to track this
+        avg_repayment_time: avg_repayment_time_secs,
     };
 
     Ok(credit_score)
