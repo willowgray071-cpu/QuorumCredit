@@ -17,6 +17,58 @@ pub const DEFAULT_VOUCH_COOLDOWN_SECS: u64 = 24 * 60 * 60; // 24 hours
 pub const TIMELOCK_DELAY: u64 = 24 * 60 * 60;
 pub const TIMELOCK_EXPIRY: u64 = 72 * 60 * 60;
 
+// ── Daily-Compound Interest Constants ─────────────────────────────────────────
+//
+// Daily compounding is layered *on top of* the static yield locked in at
+// disbursement (`total_yield`).  It is computed each time `repay()` is called
+// using the outstanding principal and the number of whole days elapsed since
+// `last_interest_calc`.
+//
+// Formula (integer, truncating):
+//   daily_interest = outstanding_principal * COMPOUND_RATE_BPS / 10_000 / 365
+//   (applied once per elapsed day)
+//
+// The approximation 1/365 avoids floating-point.  For a 365-day loan at 5 bps
+// daily the accrued interest is small relative to principal, which is the
+// intended behaviour for a microlending platform.
+
+/// Seconds in one day (86 400).
+pub const SECS_PER_DAY: u64 = 24 * 60 * 60;
+
+/// Annual interest rate in basis points used for daily compounding accrual
+/// (default 500 bps = 5% per year → ≈0.0137 bps/day).
+pub const COMPOUND_RATE_BPS: i128 = 500;
+
+// ── Milestone Bonus Constants ─────────────────────────────────────────────────
+//
+// When a borrower has repaid a certain fraction of their total obligation
+// (principal + static yield), they earn a one-time discount applied as a
+// reduction in accrued compound interest.  Each milestone may only fire once
+// per loan.  Milestones are expressed as thresholds in per-mille (‰) of the
+// total obligation that has been repaid, and as a discount in basis points
+// applied to the *remaining accrued_interest*.
+
+/// Borrower has repaid ≥ 25% of the total obligation.
+/// Reward: 10% reduction of the remaining accrued compound interest.
+pub const MILESTONE_25_PCT_PERMILLE: u32 = 250;
+pub const MILESTONE_25_DISCOUNT_BPS: i128 = 1_000; // 10% off accrued interest
+
+/// Borrower has repaid ≥ 50% of the total obligation.
+/// Reward: 20% reduction of the remaining accrued compound interest.
+pub const MILESTONE_50_PCT_PERMILLE: u32 = 500;
+pub const MILESTONE_50_DISCOUNT_BPS: i128 = 2_000; // 20% off accrued interest
+
+/// Borrower has repaid ≥ 75% of the total obligation.
+/// Reward: 30% reduction of the remaining accrued compound interest.
+pub const MILESTONE_75_PCT_PERMILLE: u32 = 750;
+pub const MILESTONE_75_DISCOUNT_BPS: i128 = 3_000; // 30% off accrued interest
+
+/// Bitmask flags stored in `milestone_bonus_applied`.
+/// Each bit represents one milestone that has already fired.
+pub const MILESTONE_FLAG_25: u32 = 0b001;
+pub const MILESTONE_FLAG_50: u32 = 0b010;
+pub const MILESTONE_FLAG_75: u32 = 0b100;
+
 // ── Loan Status ───────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -94,6 +146,10 @@ pub struct Config {
     pub loan_duration: u64,
     pub max_loan_to_stake_ratio: u32,
     pub grace_period: u64,
+    /// Minimum seconds between vouch calls from the same voucher (0 = disabled).
+    pub vouch_cooldown_secs: u64,
+    /// Minimum stake per vouch that yields non-zero yield (anti-dust guard).
+    pub min_yield_stake: i128,
 }
 
 // ── Data Types ────────────────────────────────────────────────────────────────
@@ -105,8 +161,8 @@ pub struct LoanRecord {
     pub borrower: Address,
     pub co_borrowers: Vec<Address>,
     pub amount: i128,        // total loan principal in stroops
-    pub amount_repaid: i128, // cumulative repayments received so far (principal + yield)
-    pub total_yield: i128,   // yield owed to vouchers, locked in at disbursement
+    pub amount_repaid: i128, // cumulative repayments received so far (principal + yield + interest)
+    pub total_yield: i128,   // static yield owed to vouchers, locked in at disbursement
     pub repaid: bool,
     pub defaulted: bool,
     pub created_at: u64,                  // ledger timestamp
@@ -115,6 +171,21 @@ pub struct LoanRecord {
     pub deadline: u64,                    // repayment deadline (ledger timestamp)
     pub loan_purpose: soroban_sdk::String, // borrower-supplied purpose string
     pub token_address: Address,           // token used for this loan
+
+    // ── Daily-compound interest fields ───────────────────────────────────────
+    /// Ledger timestamp of the last interest accrual.  Initialised to
+    /// `disbursement_timestamp` so the first `repay()` call charges interest
+    /// for however many whole days have elapsed since disbursement.
+    pub last_interest_calc: u64,
+    /// Total compound interest accrued so far but not yet repaid.
+    /// Updated on every `repay()` call before the payment is applied.
+    pub accrued_interest: i128,
+
+    // ── Milestone bonus field ─────────────────────────────────────────────────
+    /// Bitmask tracking which milestone bonuses have already been applied.
+    /// Bit 0 = 25 % milestone, bit 1 = 50 % milestone, bit 2 = 75 % milestone.
+    /// Once a bit is set it is never cleared, ensuring each bonus fires at most once.
+    pub milestone_bonus_applied: u32,
 }
 
 #[contracttype]

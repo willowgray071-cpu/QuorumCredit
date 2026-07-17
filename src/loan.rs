@@ -1,10 +1,13 @@
 use crate::errors::ContractError;
 use crate::helpers::{
-    config, get_active_loan_record, has_active_loan, next_loan_id, require_allowed_token,
-    require_not_paused,
+    apply_milestone_bonus, calculate_daily_compound_interest, config, get_active_loan_record,
+    has_active_loan, next_loan_id, require_allowed_token, require_not_paused,
 };
 use crate::reputation::ReputationNftExternalClient;
-use crate::types::{DataKey, LoanRecord, LoanStatus, VouchRecord, DEFAULT_REFERRAL_BONUS_BPS, MIN_VOUCH_AGE};
+use crate::types::{
+    DataKey, LoanRecord, LoanStatus, VouchRecord, DEFAULT_REFERRAL_BONUS_BPS, MIN_VOUCH_AGE,
+    SECS_PER_DAY,
+};
 use soroban_sdk::{symbol_short, Address, Env, Vec};
 
 /// Register a referrer for a borrower. Must be called before `request_loan`.
@@ -156,6 +159,11 @@ pub fn request_loan(
             deadline,
             loan_purpose,
             token_address: token_addr.clone(),
+            // Interest tracking: start the clock at disbursement so elapsed days
+            // are correctly computed on the first repayment call.
+            last_interest_calc: now,
+            accrued_interest: 0,
+            milestone_bonus_applied: 0,
         },
     );
     env.storage()
@@ -184,6 +192,28 @@ pub fn request_loan(
     Ok(())
 }
 
+/// Repay part or all of an active loan.
+///
+/// ## Interest Accrual Pipeline (executed at the top of every call)
+///
+/// 1. Compute `days_elapsed` = whole days since `last_interest_calc`.
+/// 2. Compute new interest = `calculate_daily_compound_interest(outstanding_principal, days_elapsed)`.
+/// 3. Add to `loan.accrued_interest` and advance `loan.last_interest_calc`.
+///
+/// ## Milestone Bonuses
+///
+/// After accrual and *after* adding `payment` to `amount_repaid`, we check
+/// whether any repayment milestone (25 %, 50 %, 75 %) has just been crossed
+/// for the first time.  If so, a one-time discount is applied to
+/// `accrued_interest` via `apply_milestone_bonus`.
+///
+/// ## Total Obligation
+///
+/// ```text
+/// total_owed = amount + total_yield + accrued_interest (after bonus adjustments)
+/// ```
+///
+/// A payment is valid when `0 < payment ≤ (total_owed - amount_repaid)`.
 pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractError> {
     borrower.require_auth();
     require_not_paused(&env)?;
@@ -208,19 +238,78 @@ pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractE
         "loan deadline has passed"
     );
 
-    // Total obligation = principal + yield locked in at disbursement.
-    let total_owed = loan.amount + loan.total_yield;
-    let outstanding = total_owed - loan.amount_repaid;
+    // ── Step 1: Accrue compound interest ─────────────────────────────────────
+    let now = env.ledger().timestamp();
+    let elapsed_secs = now.saturating_sub(loan.last_interest_calc);
+    let days_elapsed = elapsed_secs / SECS_PER_DAY;
+
+    if days_elapsed > 0 {
+        // Outstanding principal is everything not yet repaid, minus the static
+        // yield component (which is already accounted for in total_yield).
+        let outstanding_principal = (loan.amount - loan.amount_repaid).max(0);
+        let new_interest =
+            calculate_daily_compound_interest(outstanding_principal, days_elapsed);
+        loan.accrued_interest = loan
+            .accrued_interest
+            .checked_add(new_interest)
+            .unwrap_or(i128::MAX);
+        // Advance the clock by whole days only; any sub-day remainder rolls
+        // forward and will be picked up on the next call.
+        loan.last_interest_calc += days_elapsed * SECS_PER_DAY;
+    }
+
+    // ── Step 2: Validate payment against total obligation ────────────────────
+    //
+    // total_owed = principal + static_yield + accrued_compound_interest
+    let total_owed = loan
+        .amount
+        .checked_add(loan.total_yield)
+        .and_then(|v| v.checked_add(loan.accrued_interest))
+        .expect("total_owed overflow");
+
+    let outstanding = total_owed
+        .checked_sub(loan.amount_repaid)
+        .unwrap_or(0)
+        .max(0);
+
     assert!(
         payment > 0 && payment <= outstanding,
         "invalid payment amount"
     );
 
+    // ── Step 3: Apply payment ─────────────────────────────────────────────────
     let token = soroban_sdk::token::Client::new(&env, &loan.token_address);
-
     token.transfer(&borrower, &env.current_contract_address(), &payment);
-    loan.amount_repaid += payment;
-    let fully_repaid = loan.amount_repaid >= total_owed;
+    loan.amount_repaid = loan
+        .amount_repaid
+        .checked_add(payment)
+        .expect("amount_repaid overflow");
+
+    // ── Step 4: Check milestones (post-payment) ───────────────────────────────
+    // total_obligation for milestone fraction: principal + static yield only.
+    // (We exclude accrued_interest from the denominator so early repayers
+    // aren't penalised by a growing denominator.)
+    let total_obligation_for_milestone = loan
+        .amount
+        .checked_add(loan.total_yield)
+        .unwrap_or(loan.amount);
+
+    let (new_accrued, new_flags) = apply_milestone_bonus(
+        &loan,
+        loan.amount_repaid,
+        total_obligation_for_milestone,
+    );
+    loan.accrued_interest = new_accrued;
+    loan.milestone_bonus_applied = new_flags;
+
+    // ── Step 5: Re-check whether fully repaid (with updated accrued_interest) ─
+    let total_owed_final = loan
+        .amount
+        .checked_add(loan.total_yield)
+        .and_then(|v| v.checked_add(loan.accrued_interest))
+        .expect("total_owed_final overflow");
+
+    let fully_repaid = loan.amount_repaid >= total_owed_final;
 
     if fully_repaid {
         let vouches: Vec<VouchRecord> = env

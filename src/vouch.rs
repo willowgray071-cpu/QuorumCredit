@@ -1,5 +1,5 @@
 use crate::errors::ContractError;
-use crate::helpers::{has_active_loan, require_allowed_token, require_not_paused, require_positive_amount};
+use crate::helpers::{config, has_active_loan, require_allowed_token, require_not_paused, require_positive_amount};
 use crate::types::{DataKey, VouchRecord};
 use soroban_sdk::{symbol_short, Address, Env, Vec};
 
@@ -42,12 +42,18 @@ fn do_vouch(
     }
 
     // Rate limiting: enforce cooldown between vouch calls from the same address.
-    let _now = env.ledger().timestamp();
-    let _last: u64 = env
-        .storage()
-        .persistent()
-        .get(&DataKey::LastVouchTimestamp(voucher.clone()))
-        .unwrap_or(0);
+    let cfg = config(env);
+    if cfg.vouch_cooldown_secs > 0 {
+        let now = env.ledger().timestamp();
+        let last: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LastVouchTimestamp(voucher.clone()))
+            .unwrap_or(0);
+        if last > 0 && now < last + cfg.vouch_cooldown_secs {
+            return Err(ContractError::VouchCooldownActive);
+        }
+    }
 
     let mut vouches: Vec<VouchRecord> = env
         .storage()
