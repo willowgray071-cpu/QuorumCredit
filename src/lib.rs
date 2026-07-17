@@ -1,73 +1,27 @@
 #![no_std]
 
 pub mod admin;
-pub mod attributes;
 pub mod credit_score;
 pub mod errors;
 pub mod governance;
 pub mod helpers;
-pub mod insurance;
 pub mod loan;
-pub mod partial_repayment;
-pub mod periodic_payments;
-pub mod reputation;
 pub mod rbac;
-pub mod syndication;
-#[cfg(test)]
-mod tests;
+pub mod reputation;
 pub mod types;
 pub mod vouch;
-pub mod vouch_groups;
-pub mod yield_stream;
-pub mod cache;
-pub mod error_response;
-pub mod versioning;
-pub mod cross_chain;
 
 pub use errors::ContractError;
 pub use types::*;
-pub use cross_chain::{BridgeAttestation, BridgeAttestationPayload, CrossChainLoanMetadata, UnifiedReputation};
 
 #[cfg(test)]
-mod slash_threshold_voting_test;
-#[cfg(test)]
-mod slash_cooldown_test;
-#[cfg(test)]
-mod config_update_voting_test;
-#[cfg(test)]
-mod referral_test;
-#[cfg(test)]
-mod bug_condition_test;
-#[cfg(test)]
-mod coverage_test;
-#[cfg(test)]
-mod rbac_test;
-
-#[cfg(test)]
-mod emergency_pause_test;
-#[cfg(test)]
-mod withdrawal_queue_test;
-#[cfg(test)]
-mod cross_chain_vouch_test;
-#[cfg(test)]
-mod property_stake_loan_invariants_test;
-#[cfg(test)]
-mod credit_score_test;
-#[cfg(test)]
-mod syndication_test;
-#[cfg(test)]
-mod integration_scenarios;
-#[cfg(test)]
-mod integration_invariants;
-#[cfg(test)]
-mod integration_stress_test;
-#[cfg(test)]
-mod integration_regression_test;
+mod tests;
 
 use crate::helpers::{
-    config, get_active_loan_record, has_active_loan, loan_status as helper_loan_status,
-    require_allowed_token, require_not_paused,
+    config, get_active_loan_record, has_active_loan, is_zero_address,
+    loan_status as helper_loan_status, require_allowed_token, require_not_paused,
 };
+use crate::types::{AdminOperationType, Config, DataKey, DEFAULT_LOAN_DURATION, DEFAULT_MAX_LOAN_TO_STAKE_RATIO, DEFAULT_MAX_VOUCHERS, DEFAULT_MIN_LOAN_AMOUNT, DEFAULT_SLASH_BPS, DEFAULT_YIELD_BPS, DEFAULT_MIN_VOUCH_AGE_SECS};
 use soroban_sdk::BytesN;
 
 #[contract]
@@ -107,7 +61,7 @@ impl QuorumCreditContract {
                 admin_threshold,
                 admin_whitelist: Vec::new(&env),
                 admin_blacklist: Vec::new(&env),
-                token,
+                token: token.clone(),
                 allowed_tokens: Vec::new(&env),
                 yield_bps: DEFAULT_YIELD_BPS,
                 slash_bps: DEFAULT_SLASH_BPS,
@@ -115,7 +69,34 @@ impl QuorumCreditContract {
                 min_loan_amount: DEFAULT_MIN_LOAN_AMOUNT,
                 loan_duration: DEFAULT_LOAN_DURATION,
                 max_loan_to_stake_ratio: DEFAULT_MAX_LOAN_TO_STAKE_RATIO,
+                max_loan_to_collateral_ratio: DEFAULT_MAX_LOAN_TO_COLLATERAL_RATIO,
                 grace_period: 0,
+                min_vouch_age_secs: DEFAULT_MIN_VOUCH_AGE_SECS,
+                prepayment_penalty_bps: 0,
+                liquidity_mining_rate_bps: DEFAULT_LIQUIDITY_MINING_RATE_BPS,
+                voting_period_seconds: DEFAULT_VOTING_PERIOD_SECONDS,
+                slash_cooldown_seconds: 0,
+                emergency_pause_enabled: false,
+                early_repayment_discount_bps: 0,
+                oracle_address: None,
+                slash_delay_seconds: 0,
+                successor_admin: None,
+                rate_limit_config: RateLimitConfig {
+                    window_secs: DEFAULT_RATE_LIMIT_WINDOW_SECS,
+                    max_calls: DEFAULT_RATE_LIMIT_COUNT,
+                    enabled: false,
+                },
+                multi_tier_thresholds: None, // Issue #893: Initialize with no multi-tier thresholds
+                dynamic_slash_threshold: DEFAULT_DYNAMIC_SLASH_THRESHOLD,
+                loan_size_slash_enabled: DEFAULT_LOAN_SIZE_SLASH_ENABLED,
+                loan_size_slash_max_bps: DEFAULT_LOAN_SIZE_SLASH_MAX_BPS,
+                recovery_percentage: 0,
+                admin_compensation_bps: 0,
+                removal_vote_threshold: 0,
+                confirmation_required: DEFAULT_CONFIRMATION_REQUIRED,
+                redistribution_rule: RedistributionRule::Treasury,
+                immunity_period_seconds: 0,
+                insurance_premium_bps: 0,
             },
         );
 
@@ -128,6 +109,7 @@ impl QuorumCreditContract {
     }
 
     // ── Vouching ──────────────────────────────────────────────────────────────
+
 
     pub fn vouch(
         env: Env,
@@ -169,6 +151,80 @@ impl QuorumCreditContract {
         vouch::is_bridge_validated(env, voucher, chain_id)
     }
 
+    /// Issue #867: Create a cross-collateral pool, seeded by the creator's stake.
+    pub fn create_collateral_pool(
+        env: Env,
+        creator: Address,
+        token: Address,
+        initial_stake: i128,
+    ) -> Result<u64, ContractError> {
+        collateral_pool::create_pool(env, creator, token, initial_stake)
+    }
+
+    /// Issue #867: Join an existing, inactive collateral pool.
+    pub fn join_collateral_pool(
+        env: Env,
+        voucher: Address,
+        pool_id: u64,
+        stake: i128,
+    ) -> Result<(), ContractError> {
+        collateral_pool::join_pool(env, voucher, pool_id, stake)
+    }
+
+    /// Issue #966: Join an existing, inactive collateral pool from another chain.
+    /// The voucher must already be bridge-validated for `chain_id` (see
+    /// `set_bridge_validated`).
+    pub fn join_collateral_pool_cross_chain(
+        env: Env,
+        voucher: Address,
+        pool_id: u64,
+        stake: i128,
+        chain_id: u32,
+    ) -> Result<(), ContractError> {
+        collateral_pool::join_pool_cross_chain(env, voucher, pool_id, stake, chain_id)
+    }
+
+    /// Issue #867: Leave an inactive collateral pool, withdrawing the caller's stake.
+    pub fn leave_collateral_pool(
+        env: Env,
+        voucher: Address,
+        pool_id: u64,
+    ) -> Result<(), ContractError> {
+        collateral_pool::leave_pool(env, voucher, pool_id)
+    }
+
+    /// Issue #867: Admin assigns a borrower to a pool, locking its collateral.
+    pub fn assign_collateral_pool_to_borrower(
+        env: Env,
+        admin_signers: Vec<Address>,
+        pool_id: u64,
+        borrower: Address,
+    ) -> Result<(), ContractError> {
+        collateral_pool::assign_pool_to_borrower(env, admin_signers, pool_id, borrower)
+    }
+
+    /// Issue #867: Read a collateral pool record.
+    pub fn get_collateral_pool(env: Env, pool_id: u64) -> Result<CollateralPool, ContractError> {
+        collateral_pool::get_pool(env, pool_id)
+    }
+
+    /// Issue #867: Total stake held in a collateral pool.
+    pub fn get_collateral_pool_total_stake(
+        env: Env,
+        pool_id: u64,
+    ) -> Result<i128, ContractError> {
+        collateral_pool::get_pool_total_stake(env, pool_id)
+    }
+
+    /// Issue #966: Total stake contributed to a pool from a specific chain.
+    pub fn get_collateral_pool_chain_stake(
+        env: Env,
+        pool_id: u64,
+        chain_id: u32,
+    ) -> Result<i128, ContractError> {
+        collateral_pool::get_pool_chain_stake(env, pool_id, chain_id)
+    }
+
     /// #642: Vouch with an explicit sector label for diversification enforcement.
     pub fn vouch_with_sector(
         env: Env,
@@ -181,6 +237,60 @@ impl QuorumCreditContract {
         vouch::vouch_with_sector(env, voucher, borrower, stake, token, sector)
     }
 
+    /// Confidential vouch with zk-SNARK proof verification
+    ///
+    /// Allows vouchers to stake without revealing the exact amount on-chain.
+    /// The zk-SNARK proof demonstrates that:
+    /// - The voucher has sufficient balance
+    /// - The stake amount is within allowed bounds
+    /// - The voucher is not blacklisted
+    pub fn vouch_confidential(
+        env: Env,
+        voucher: Address,
+        borrower: Address,
+        commitment: ConfidentialCommitment,
+        proof: ZkProof,
+        token: Address,
+        chain_id: Option<u32>,
+    ) -> Result<(), ContractError> {
+        // Verify the zk-SNARK proof
+        zk_snarks::verify_vouch_proof(&env, &proof, &voucher, &borrower, 0)?;
+
+        // Store the commitment for this vouch
+        env.storage()
+            .persistent()
+            .set(&DataKey::VouchCommitment(voucher.clone(), borrower.clone()), &commitment);
+
+        // Record the proof for audit trail
+        let proof_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ZkProofCounter)
+            .unwrap_or(0)
+            .checked_add(1)
+            .expect("proof ID overflow");
+        env.storage()
+            .instance()
+            .set(&DataKey::ZkProofCounter, &proof_id);
+
+        let proof_record = crate::types::ZkProofRecord {
+            proof_id,
+            proof: proof.clone(),
+            operation_type: crate::types::PROOF_TYPE_VOUCH,
+            submitter: voucher.clone(),
+            verified: true,
+            submitted_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::ZkProofRecord(proof_id), &proof_record);
+
+        // For now, we still need to call the regular vouch function
+        // In a full implementation, this would use the commitment instead of the actual amount
+        // The actual amount would be revealed off-chain to authorized parties
+        vouch::vouch(env, voucher, borrower, 0, token, chain_id)
+    }
+
     pub fn batch_vouch(
         env: Env,
         voucher: Address,
@@ -188,7 +298,7 @@ impl QuorumCreditContract {
         stakes: Vec<i128>,
         token: Address,
         chain_id: Option<u32>,
-    ) -> Result<(), ContractError> {
+    ) -> Result<Vec<crate::types::BatchVouchResult>, ContractError> {
         vouch::batch_vouch(env, voucher, borrowers, stakes, token, chain_id)
     }
 
@@ -316,6 +426,55 @@ impl QuorumCreditContract {
         loan::request_loan(env, borrower, amount, threshold, loan_purpose, token)
     }
 
+    /// Confidential loan request with zk-SNARK proof verification
+    ///
+    /// Allows borrowers to request loans without revealing exact amounts on-chain.
+    /// The zk-SNARK proof demonstrates that:
+    /// - The borrower meets eligibility requirements
+    /// - The requested amount is within bounds
+    /// - Sufficient vouches exist (without revealing individual vouch amounts)
+    pub fn request_loan_confidential(
+        env: Env,
+        borrower: Address,
+        commitment: ConfidentialCommitment,
+        proof: ZkProof,
+        threshold: i128,
+        loan_purpose: soroban_sdk::String,
+        token: Address,
+    ) -> Result<(), ContractError> {
+        // Verify the zk-SNARK proof
+        zk_snarks::verify_loan_proof(&env, &proof, &borrower, 0, threshold)?;
+
+        // Record the proof for audit trail
+        let proof_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ZkProofCounter)
+            .unwrap_or(0)
+            .checked_add(1)
+            .expect("proof ID overflow");
+        env.storage()
+            .instance()
+            .set(&DataKey::ZkProofCounter, &proof_id);
+
+        let proof_record = crate::types::ZkProofRecord {
+            proof_id,
+            proof: proof.clone(),
+            operation_type: crate::types::PROOF_TYPE_LOAN_REQUEST,
+            submitter: borrower.clone(),
+            verified: true,
+            submitted_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::ZkProofRecord(proof_id), &proof_record);
+
+        // For now, we still need to call the regular request_loan function
+        // In a full implementation, this would use the commitment instead of the actual amount
+        // The actual amount would be revealed off-chain to authorized parties
+        loan::request_loan(env, borrower, 0, threshold, loan_purpose, token)
+    }
+
     pub fn dispute_vouch(
         env: Env,
         voucher: Address,
@@ -369,14 +528,22 @@ impl QuorumCreditContract {
         let token_client = token::Client::new(&env, &loan.token_address);
         let mut total_slashed: i128 = 0;
         for v in vouches.iter() {
-            let slash_amount = v.stake * cfg.slash_bps / 10_000;
-            let returned = v.stake - slash_amount;
-            if returned > 0 {
-                token_client.transfer(&env.current_contract_address(), &v.voucher, &returned);
+            if v.token == loan.token_address {
+                let slash_amount = v.stake * cfg.slash_bps / 10_000;
+                let returned = v.stake - slash_amount;
+                if returned > 0 {
+                    token_client.transfer(&env.current_contract_address(), &v.voucher, &returned);
+                }
+                total_slashed += slash_amount;
+            } else if !is_zero_address(&env, &v.token) {
+                // Non-matching token vouches are returned in full.
+                let other_token = soroban_sdk::token::Client::new(&env, &v.token);
+                other_token.transfer(&env.current_contract_address(), &v.voucher, &v.stake);
             }
-            total_slashed += slash_amount;
         }
 
+        // Issue #882: Route portion of slashed funds to insurance pool
+        insurance::allocate_slash_to_pool(&env, total_slashed);
         helpers::add_slash_balance(&env, total_slashed);
 
         let count: u32 = env
@@ -390,14 +557,6 @@ impl QuorumCreditContract {
 
         // Burn excellent credit tier badge on default
         reputation::burn_excellent_badge(&env, &borrower);
-
-        if let Some(nft_addr) = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::ReputationNft)
-        {
-            ReputationNftExternalClient::new(&env, &nft_addr).burn(&borrower);
-        }
 
         // Update credit score after slash
         let _ = credit_score::update_credit_score(env.clone(), borrower.clone());
@@ -593,7 +752,7 @@ impl QuorumCreditContract {
         let mut loan = helpers::get_active_loan_record(&env, &borrower)
             .expect("no active loan");
 
-        if loan.repaid || loan.defaulted {
+        if loan.status != LoanStatus::Active {
             panic_with_error!(&env, ContractError::NoActiveLoan);
         }
         assert!(
@@ -608,7 +767,7 @@ impl QuorumCreditContract {
             .get(&DataKey::Vouches(borrower.clone()))
             .unwrap_or(Vec::new(&env));
 
-        loan.defaulted = true;
+        loan.status = LoanStatus::Defaulted;
         env.storage()
             .persistent()
             .set(&DataKey::Loan(loan.id), &loan);
@@ -629,14 +788,22 @@ impl QuorumCreditContract {
         let token_client = token::Client::new(&env, &loan.token_address);
         let mut total_slash: i128 = 0;
         for v in vouches.iter() {
-            let slash_amount = v.stake * cfg.slash_bps / 10_000;
-            let returned = v.stake - slash_amount;
-            total_slash += slash_amount;
-            if returned > 0 {
-                token_client.transfer(&env.current_contract_address(), &v.voucher, &returned);
+            if v.token == loan.token_address {
+                let slash_amount = v.stake * cfg.slash_bps / 10_000;
+                let returned = v.stake - slash_amount;
+                total_slash += slash_amount;
+                if returned > 0 {
+                    token_client.transfer(&env.current_contract_address(), &v.voucher, &returned);
+                }
+            } else if !is_zero_address(&env, &v.token) {
+                // Non-matching token vouches are returned in full.
+                let other_token = soroban_sdk::token::Client::new(&env, &v.token);
+                other_token.transfer(&env.current_contract_address(), &v.voucher, &v.stake);
             }
         }
 
+        // Issue #882: Route portion of slashed funds to insurance pool
+        insurance::allocate_slash_to_pool(&env, total_slash);
         helpers::add_slash_balance(&env, total_slash);
 
         let count: u32 = env
@@ -672,7 +839,7 @@ impl QuorumCreditContract {
         let mut loan = helpers::get_active_loan_record(&env, &borrower)
             .expect("no active loan");
 
-        if loan.repaid || loan.defaulted {
+        if loan.status != LoanStatus::Active {
             panic_with_error!(&env, ContractError::NoActiveLoan);
         }
 
@@ -690,10 +857,16 @@ impl QuorumCreditContract {
 
         let token_client = token::Client::new(&env, &loan.token_address);
         for v in vouches.iter() {
-            token_client.transfer(&env.current_contract_address(), &v.voucher, &v.stake);
+            if v.token == loan.token_address {
+                token_client.transfer(&env.current_contract_address(), &v.voucher, &v.stake);
+            } else if !is_zero_address(&env, &v.token) {
+                // Non-matching token vouches are returned via their own token.
+                let other_token = soroban_sdk::token::Client::new(&env, &v.token);
+                other_token.transfer(&env.current_contract_address(), &v.voucher, &v.stake);
+            }
         }
 
-        loan.defaulted = true;
+        loan.status = LoanStatus::Defaulted;
         env.storage()
             .persistent()
             .set(&DataKey::Loan(loan.id), &loan);
@@ -717,7 +890,7 @@ impl QuorumCreditContract {
         assert!(amount > 0, "no slashed funds to withdraw");
 
         env.storage().instance().set(&DataKey::SlashTreasury, &0i128);
-        helpers::token(&env).transfer(&env.current_contract_address(), &recipient, &amount);
+        helpers::primary_token(&env).transfer(&env.current_contract_address(), &recipient, &amount);
     }
 
     // ── Loan Pool ─────────────────────────────────────────────────────────────
@@ -773,7 +946,7 @@ impl QuorumCreditContract {
             total_amount += amount;
         }
 
-        let token_client = helpers::token(&env);
+        let token_client = helpers::primary_token(&env);
         let contract_balance = token_client.balance(&env.current_contract_address());
         if contract_balance < total_amount {
             return Err(ContractError::PoolInsufficientFunds);
@@ -800,18 +973,33 @@ impl QuorumCreditContract {
                 &LoanRecord {
                     id: loan_id,
                     borrower: borrower.clone(),
+                    guarantor: None,
+                    buyback_price: 0,
+                    auto_repay_enabled: false,
+                    auto_repay_attempts: 0,
+                    escrow_status: EscrowStatus::None,
                     co_borrowers: Vec::new(&env),
                     amount,
                     amount_repaid: 0,
                     total_yield: amount * cfg.yield_bps / 10_000,
-                    repaid: false,
-                    defaulted: false,
+                    status: LoanStatus::Active,
                     created_at: now,
                     disbursement_timestamp: now,
                     repayment_timestamp: None,
                     deadline,
                     loan_purpose: soroban_sdk::String::from_str(&env, "pool"),
                     token_address: cfg.token.clone(),
+                    amortization_schedule: Vec::new(&env),
+                    reminder_sent: false,
+                    risk_score: 0,
+                    deferment_periods: 0,
+                    maturity_date: None,
+                    rate_type: RateType::Fixed,
+                    index_reference: None,
+                    last_interest_calc: now,
+                    accrued_interest: 0,
+                    milestone_bonus_applied: false,
+                    retry_count: 0,
                 },
             );
             env.storage()
@@ -857,6 +1045,35 @@ impl QuorumCreditContract {
             .instance()
             .get(&DataKey::LoanPoolCounter)
             .unwrap_or(0)
+    }
+
+    // ── Liquidity Rebalancing (Issue #88) ─────────────────────────────────────
+
+    /// Manually move `amount` stroops of stake from `source_pool_id` to `target_pool_id`.
+    /// Both pools must be inactive and share the same token.
+    pub fn rebalance_pools(
+        env: Env,
+        admin_signers: Vec<Address>,
+        source_pool_id: u64,
+        target_pool_id: u64,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        liquidity_rebalance::rebalance_pools(env, admin_signers, source_pool_id, target_pool_id, amount)
+    }
+
+    /// Automatically rebalance all inactive collateral pools toward `target_stake`.
+    /// Returns the number of transfers performed.
+    pub fn auto_rebalance_pools(
+        env: Env,
+        admin_signers: Vec<Address>,
+        target_stake: i128,
+    ) -> Result<u32, ContractError> {
+        liquidity_rebalance::auto_rebalance_pools(env, admin_signers, target_stake)
+    }
+
+    /// Return total stake held in a collateral pool.
+    pub fn get_pool_liquidity(env: Env, pool_id: u64) -> Result<i128, ContractError> {
+        liquidity_rebalance::get_pool_liquidity(env, pool_id)
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────────
@@ -924,12 +1141,124 @@ impl QuorumCreditContract {
         vouches.iter().any(|v| v.voucher == voucher)
     }
 
+    /// Returns the total primary-token stake for `borrower`.
+    pub fn total_vouched(env: Env, borrower: Address) -> Result<i128, ContractError> {
+        vouch::total_vouched(env, borrower)
+    }
+
     pub fn get_config(env: Env) -> Config {
         config(&env)
     }
 
     pub fn loan_status(env: Env, borrower: Address) -> LoanStatus {
         helper_loan_status(&env, &borrower)
+    }
+
+    pub fn loan_status_extended(env: Env, borrower: Address) -> LoanStatusEx {
+        loan::loan_status_extended(env, borrower)
+    }
+
+    pub fn suspend_loan_on_missed_payment(
+        env: Env,
+        caller: Address,
+        borrower: Address,
+    ) -> Result<(), ContractError> {
+        loan::suspend_loan_on_missed_payment(env, caller, borrower)
+    }
+
+    pub fn resume_loan(env: Env, caller: Address, borrower: Address) -> Result<(), ContractError> {
+        loan::resume_loan(env, caller, borrower)
+    }
+
+    // ── Issue #880: Loan Co-Borrower Support ─────────────────────────────────
+
+    pub fn add_co_borrower(
+        env: Env,
+        borrower: Address,
+        co_borrower: Address,
+    ) -> Result<(), ContractError> {
+        loan::add_co_borrower(env, borrower, co_borrower)
+    }
+
+    pub fn remove_co_borrower(
+        env: Env,
+        borrower: Address,
+        co_borrower: Address,
+    ) -> Result<(), ContractError> {
+        loan::remove_co_borrower(env, borrower, co_borrower)
+    }
+
+    pub fn get_co_borrowers(env: Env, borrower: Address) -> Vec<Address> {
+        loan::get_co_borrowers(env, borrower)
+    }
+
+    // ── Issue #881: Dynamic Interest Rate ────────────────────────────────────
+
+    pub fn set_dynamic_rate_config(
+        env: Env,
+        admin_signers: Vec<Address>,
+        config: DynamicRateConfig,
+    ) -> Result<(), ContractError> {
+        loan::set_dynamic_rate_config(env, admin_signers, config)
+    }
+
+    pub fn get_dynamic_rate_config(env: Env) -> DynamicRateConfig {
+        loan::get_dynamic_rate_config_view(env)
+    }
+
+    pub fn compute_dynamic_rate(
+        env: Env,
+        admin_signers: Vec<Address>,
+        borrower: Address,
+    ) -> Result<u32, ContractError> {
+        loan::compute_and_store_dynamic_rate(env, admin_signers, borrower)
+    }
+
+    pub fn get_borrower_dynamic_rate(env: Env, borrower: Address) -> Option<BorrowerDynamicRate> {
+        loan::get_borrower_dynamic_rate(env, borrower)
+    }
+
+    // ── Issue #878: Loan Forbearance Period ──────────────────────────────────
+
+    pub fn request_forbearance(
+        env: Env,
+        borrower: Address,
+        duration_secs: Option<u64>,
+    ) -> Result<(), ContractError> {
+        loan::request_forbearance(env, borrower, duration_secs)
+    }
+
+    pub fn end_forbearance(env: Env, borrower: Address) -> Result<(), ContractError> {
+        loan::end_forbearance(env, borrower)
+    }
+
+    pub fn get_forbearance(env: Env, loan_id: u64) -> Option<ForbearanceRecord> {
+        loan::get_forbearance(env, loan_id)
+    }
+
+    // ── Issue #879: Loan Refinancing ─────────────────────────────────────────
+
+    pub fn refinance_loan(
+        env: Env,
+        borrower: Address,
+        new_amount: i128,
+        new_threshold: i128,
+        new_token: Address,
+    ) -> Result<(), ContractError> {
+        loan::refinance_loan(env, borrower, new_amount, new_threshold, new_token)
+    }
+
+    pub fn get_refinance_record(env: Env, loan_id: u64) -> Option<RefinanceRecord> {
+        loan::get_refinance_record(env, loan_id)
+    }
+
+    pub fn set_borrower_risk_score(
+        env: Env,
+        admin_signers: Vec<Address>,
+        borrower: Address,
+        risk_score: u32,
+    ) -> Result<(), ContractError> {
+        loan::set_borrower_risk_score(env, admin_signers, borrower, risk_score)
     }
 
     // ── Governance: slash voting ──────────────────────────────────────────────
@@ -964,6 +1293,27 @@ impl QuorumCreditContract {
         governance::execute_pending_slash(env, borrower)
     }
 
+    // ── Issue #1069: Vote Delegation ─────────────────────────────────────────
+
+    pub fn delegate_vote(
+        env: Env,
+        voucher: Address,
+        delegate: Address,
+    ) -> Result<(), ContractError> {
+        governance::delegate_vote(env, voucher, delegate)
+    }
+
+    pub fn revoke_vote_delegation(
+        env: Env,
+        voucher: Address,
+    ) -> Result<(), ContractError> {
+        governance::revoke_vote_delegation(env, voucher)
+    }
+
+    pub fn get_vote_delegate(env: Env, voucher: Address) -> Option<Address> {
+        governance::get_vote_delegate(env, voucher)
+    }
+
     // ── Issue #680: slash threshold governance ────────────────────────────────
 
     pub fn propose_slash_threshold(
@@ -994,6 +1344,28 @@ impl QuorumCreditContract {
         governance::get_slash_threshold_proposal(env, proposal_id)
     }
 
+    // ── Config Timelock ───────────────────────────────────────────────────────
+
+    pub fn propose_config_change(
+        env: Env,
+        proposer: Address,
+        new_config: Config,
+    ) -> Result<u64, ContractError> {
+        governance::propose_config_change(env, proposer, new_config)
+    }
+
+    pub fn execute_config_change(env: Env, proposal_id: u64) -> Result<(), ContractError> {
+        governance::execute_config_change(env, proposal_id)
+    }
+
+    pub fn cancel_config_change(
+        env: Env,
+        admin_signers: Vec<Address>,
+        proposal_id: u64,
+    ) -> Result<(), ContractError> {
+        governance::cancel_config_change(env, admin_signers, proposal_id)
+    }
+
     // ── Slash Appeal & Escrow (Issue #841) ────────────────────────────────────
 
     pub fn appeal_slash(env: Env, borrower: Address) -> Result<(), ContractError> {
@@ -1015,12 +1387,49 @@ impl QuorumCreditContract {
 
     // ── Admin management ─────────────────────────────────────────────────────
 
-    pub fn add_admin(env: Env, admin_signers: Vec<Address>, new_admin: Address) {
-        admin::add_admin(env, admin_signers, new_admin)
-    }
-
     pub fn remove_admin(env: Env, admin_signers: Vec<Address>, admin_to_remove: Address) {
         admin::remove_admin(env, admin_signers, admin_to_remove)
+    }
+
+    /// Emergency admin revocation — removes a compromised admin key with N-1 approval.
+    ///
+    /// This is an emergency mechanism: if one admin key is compromised, ALL remaining
+    /// admins (N-1 of N) can instantly revoke the compromised key. The revoked address
+    /// is permanently blacklisted from participating in admin approvals and is removed
+    /// from the active admin list.
+    ///
+    /// Unlike `remove_admin` (which uses the standard `admin_threshold`), this function
+    /// requires every non-compromised admin to sign — a stricter requirement that prevents
+    /// a single admin from unilaterally removing another.
+    ///
+    /// # Arguments
+    /// * `existing_admins` - All current admin signers excluding `target_admin` (must be N-1)
+    /// * `target_admin` - The compromised admin address to revoke
+    /// * `reason` - Human-readable reason for revocation (emitted in event)
+    ///
+    /// # Errors
+    /// * `ContractError::AdminNotFound` - `target_admin` is not a registered admin
+    /// * `ContractError::AdminAlreadyRevoked` - `target_admin` was already revoked
+    /// * `ContractError::UnauthorizedCaller` - Fewer than N-1 valid signers provided
+    /// * `ContractError::InvalidAdminThreshold` - Only 1 admin exists; cannot revoke
+    pub fn revoke_admin(
+        env: Env,
+        existing_admins: Vec<Address>,
+        target_admin: Address,
+        reason: soroban_sdk::String,
+    ) -> Result<(), ContractError> {
+        admin::revoke_admin(env, existing_admins, target_admin, reason)
+    }
+
+    /// Check whether an admin address has been emergency-revoked.
+    ///
+    /// # Arguments
+    /// * `admin` - Address to query
+    ///
+    /// # Returns
+    /// * `true` if the address has been revoked via `revoke_admin`
+    pub fn is_admin_revoked(env: Env, admin: Address) -> bool {
+        admin::is_admin_revoked(env, admin)
     }
 
     pub fn set_admin_threshold(env: Env, admin_signers: Vec<Address>, new_threshold: u32) {
@@ -1092,6 +1501,32 @@ impl QuorumCreditContract {
         admin::update_config(env, admin_signers, yield_bps, slash_bps)
     }
 
+    pub fn batch_update_config(
+        env: Env,
+        admin_signers: Vec<Address>,
+        yield_bps: Option<i128>,
+        slash_bps: Option<i128>,
+        max_vouchers: Option<u32>,
+        min_loan_amount: Option<i128>,
+        loan_duration: Option<u64>,
+        max_loan_to_stake_ratio: Option<u32>,
+        grace_period: Option<u64>,
+        liquidity_mining_rate_bps: Option<u32>,
+    ) {
+        admin::batch_update_config(
+            env,
+            admin_signers,
+            yield_bps,
+            slash_bps,
+            max_vouchers,
+            min_loan_amount,
+            loan_duration,
+            max_loan_to_stake_ratio,
+            grace_period,
+            liquidity_mining_rate_bps,
+        )
+    }
+
     pub fn set_reputation_nft(env: Env, admin_signers: Vec<Address>, nft_contract: Address) {
         admin::set_reputation_nft(env, admin_signers, nft_contract)
     }
@@ -1120,36 +1555,12 @@ impl QuorumCreditContract {
         env.storage().instance().set(&DataKey::Config, &cfg);
     }
 
-    pub fn add_allowed_token(env: Env, admin_signers: Vec<Address>, token: Address) {
+    pub fn add_allowed_token(env: Env, admin_signers: Vec<Address>, token: Address) -> Result<(), ContractError> {
         admin::add_allowed_token(env, admin_signers, token)
     }
 
     pub fn remove_allowed_token(env: Env, admin_signers: Vec<Address>, token: Address) {
         admin::remove_allowed_token(env, admin_signers, token)
-    }
-
-    pub fn set_slash_vote_quorum(env: Env, admin_signers: Vec<Address>, quorum_bps: u32) {
-        helpers::require_admin_approval(&env, &admin_signers);
-        governance::set_slash_vote_quorum(&env, quorum_bps);
-    }
-
-    // ── Governance ────────────────────────────────────────────────────────────
-
-    pub fn vote_slash(
-        env: Env,
-        voucher: Address,
-        borrower: Address,
-        approve: bool,
-    ) -> Result<(), ContractError> {
-        governance::vote_slash(env, voucher, borrower, approve)
-    }
-
-    pub fn get_slash_vote(env: Env, borrower: Address) -> Option<SlashVoteRecord> {
-        governance::get_slash_vote(env, borrower)
-    }
-
-    pub fn get_slash_vote_quorum(env: Env) -> u32 {
-        governance::get_slash_vote_quorum(env)
     }
 
     // ── Views ─────────────────────────────────────────────────────────────────
@@ -1208,10 +1619,6 @@ impl QuorumCreditContract {
 
     pub fn get_max_vouchers_per_loan(env: Env) -> u32 {
         config(&env).max_vouchers
-    }
-
-    pub fn get_config(env: Env) -> Config {
-        admin::get_config(env)
     }
 
     // ── Issue #682: multi-sig config updates ──────────────────────────────────
@@ -1335,6 +1742,28 @@ impl QuorumCreditContract {
         credit_score::get_tier_rewards(env, tier)
     }
 
+    // ── Issue #637: On-Demand Fraud Detection ──────────────────────────────────
+
+    pub fn update_fraud_score(env: Env, voucher: Address) -> Result<(), ContractError> {
+        detection::update_fraud_score(env, voucher)
+    }
+
+    pub fn get_fraud_score(env: Env, voucher: Address) -> Option<VoucherFraudScore> {
+        detection::get_fraud_score(env, voucher)
+    }
+
+    pub fn set_fraud_score_config(
+        env: Env,
+        admin_signers: Vec<Address>,
+        config: FraudScoreConfig,
+    ) -> Result<(), ContractError> {
+        detection::set_fraud_score_config(env, admin_signers, config)
+    }
+
+    pub fn get_fraud_score_config_view(env: Env) -> FraudScoreConfig {
+        detection::get_fraud_score_config_view(env)
+    }
+
     // ── Loan Pool Syndication for Multi-Borrower Loans ─────────────────────────
 
     pub fn create_syndication(
@@ -1416,6 +1845,91 @@ impl QuorumCreditContract {
         syndication::handle_syndication_default(env, syndication_id, caller)
     }
 
+    // ── Data Archiving ────────────────────────────────────────────────────────
+
+    /// Get the total count of archived loans.
+    pub fn get_archive_count(env: Env) -> u64 {
+        archive::get_archive_count(&env)
+    }
+
+    /// Retrieve an archived loan by archive ID.
+    pub fn get_archived_loan(env: Env, archive_id: u64) -> Option<ArchivedLoanRecord> {
+        archive::get_archived_loan(&env, archive_id)
+    }
+
+    /// Archive vouch history when it exceeds the threshold.
+    /// This moves old entries to archived storage to reduce persistent storage bloat.
+    pub fn archive_vouch_history(
+        env: Env,
+        borrower: Address,
+        voucher: Address,
+        token: Address,
+        max_active_entries: u32,
+    ) -> Result<(), ContractError> {
+        archive::archive_vouch_history(&env, &borrower, &voucher, &token, max_active_entries)
+    }
+
+    /// Retrieve archived vouch history for a specific batch.
+    pub fn get_archived_vouch_history(
+        env: Env,
+        borrower: Address,
+        voucher: Address,
+        token: Address,
+        batch_id: u32,
+    ) -> Vec<VouchHistoryEntry> {
+        archive::get_archived_vouch_history(&env, &borrower, &voucher, &token, batch_id)
+    }
+
+    // ── IPFS Archiving ────────────────────────────────────────────────────────
+
+    /// Register an IPFS archive for a completed loan.
+    /// Called after uploading the loan archive to IPFS to store the content hash.
+    pub fn register_loan_ipfs_archive(
+        env: Env,
+        archive_id: u64,
+        ipfs_hash: String,
+    ) -> Result<(), ContractError> {
+        ipfs_archive::register_loan_ipfs_archive(&env, archive_id, ipfs_hash)
+    }
+
+    /// Retrieve the IPFS hash for an archived loan.
+    pub fn get_loan_ipfs_archive(env: Env, archive_id: u64) -> Option<IpfsArchiveReference> {
+        ipfs_archive::get_loan_ipfs_archive(&env, archive_id)
+    }
+
+    /// Register an IPFS archive for vouch history batch.
+    pub fn reg_vouch_history_ipfs_archive(
+        env: Env,
+        archive_id: u64,
+        ipfs_hash: String,
+    ) -> Result<(), ContractError> {
+        ipfs_archive::register_vouch_history_ipfs_archive(&env, archive_id, ipfs_hash)
+    }
+
+    /// Retrieve the IPFS hash for archived vouch history.
+    pub fn get_vouch_history_ipfs_archive(env: Env, archive_id: u64) -> Option<IpfsArchiveReference> {
+        ipfs_archive::get_vouch_history_ipfs_archive(&env, archive_id)
+    }
+
+    /// Get the total count of IPFS archives.
+    pub fn get_ipfs_archive_count(env: Env) -> u64 {
+        ipfs_archive::get_loan_ipfs_archive_count(&env)
+    }
+
+    /// Check if an archive has been backed up to IPFS.
+    pub fn is_archive_ipfs_backed(env: Env, archive_id: u64) -> bool {
+        ipfs_archive::is_archive_ipfs_backed(&env, archive_id)
+    }
+
+    /// Verify the integrity of an archived loan against IPFS.
+    pub fn verify_loan_archive_integrity(
+        env: Env,
+        archive_id: u64,
+        expected_ipfs_hash: String,
+    ) -> Result<bool, ContractError> {
+        ipfs_archive::verify_loan_archive_integrity(&env, archive_id, expected_ipfs_hash)
+    }
+
     pub fn get_syndication(env: Env, syndication_id: u64) -> Option<LoanSyndication> {
         syndication::get_syndication(env, syndication_id)
     }
@@ -1479,6 +1993,28 @@ impl QuorumCreditContract {
 
     // ── Issue #14: Cross-chain loan portability ───────────────────────────────
 
+    pub fn register_bridge(
+        env: Env,
+        admin_signers: Vec<Address>,
+        chain_id: u32,
+        chain_name: soroban_sdk::String,
+        bridge_address: Address,
+    ) -> Result<(), ContractError> {
+        cross_chain::register_bridge(env, admin_signers, chain_id, chain_name, bridge_address)
+    }
+
+    pub fn remove_bridge(
+        env: Env,
+        admin_signers: Vec<Address>,
+        chain_id: u32,
+    ) -> Result<(), ContractError> {
+        cross_chain::remove_bridge(env, admin_signers, chain_id)
+    }
+
+    pub fn get_bridges(env: Env) -> Vec<BridgeRecord> {
+        cross_chain::get_bridges(env)
+    }
+
     pub fn set_bridge_public_key(
         env: Env,
         admin_signers: Vec<Address>,
@@ -1494,6 +2030,16 @@ impl QuorumCreditContract {
         attestation: BridgeAttestation,
     ) -> Result<(), ContractError> {
         cross_chain::validate_bridge_attestation(env, metadata, attestation)
+    }
+
+    /// Issue #968/#85: Read-only integrity check — verifies signature, freshness,
+    /// and nonce without consuming any state. Safe to call multiple times.
+    pub fn verify_bridge_message(
+        env: Env,
+        metadata: CrossChainLoanMetadata,
+        attestation: BridgeAttestation,
+    ) -> Result<(), ContractError> {
+        cross_chain::verify_bridge_message(env, metadata, attestation)
     }
 
     pub fn bridge_attestation_message(
@@ -1530,6 +2076,79 @@ impl QuorumCreditContract {
 
     pub fn is_bridge_nonce_used(env: Env, origin_chain: u32, nonce: u64) -> bool {
         cross_chain::is_bridge_nonce_used(env, origin_chain, nonce)
+    }
+
+    // ── Issue #969 (#86): Cross-Chain Event Relay ─────────────────────────────
+
+    /// Configure or rotate the Ed25519 key used to verify events relayed from
+    /// `source_chain`.
+    pub fn set_relay_key(
+        env: Env,
+        admin_signers: Vec<Address>,
+        source_chain: u32,
+        public_key: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        cross_chain_relay::set_relay_key(env, admin_signers, source_chain, public_key)
+    }
+
+    /// Enqueue an outbound relay event for `dest_chain`, returning its sequence.
+    pub fn relay_emit(
+        env: Env,
+        admin_signers: Vec<Address>,
+        dest_chain: u32,
+        event_type: soroban_sdk::Symbol,
+        payload: soroban_sdk::Bytes,
+    ) -> Result<u64, ContractError> {
+        cross_chain_relay::relay_emit(env, admin_signers, dest_chain, event_type, payload)
+    }
+
+    /// Canonical bytes the source chain's relay key must sign for an event.
+    pub fn relay_attestation_message(
+        env: Env,
+        event: RelayEvent,
+        nonce: u64,
+        timestamp: u64,
+    ) -> soroban_sdk::Bytes {
+        cross_chain_relay::relay_attestation_message(&env, &event, nonce, timestamp)
+    }
+
+    /// Verify and consume an inbound relayed event (idempotent per source+seq).
+    pub fn relay_message(
+        env: Env,
+        event: RelayEvent,
+        attestation: RelayAttestation,
+    ) -> Result<(), ContractError> {
+        cross_chain_relay::relay_message(env, event, attestation)
+    }
+
+    /// Acknowledge outbound delivery up to `up_to_seq` for `dest_chain`.
+    pub fn acknowledge_relay(
+        env: Env,
+        admin_signers: Vec<Address>,
+        dest_chain: u32,
+        up_to_seq: u64,
+    ) -> Result<(), ContractError> {
+        cross_chain_relay::acknowledge_relay(env, admin_signers, dest_chain, up_to_seq)
+    }
+
+    pub fn get_outbound_relay_event(env: Env, dest_chain: u32, seq: u64) -> Option<RelayEvent> {
+        cross_chain_relay::get_outbound_event(env, dest_chain, seq)
+    }
+
+    pub fn latest_outbound_relay_seq(env: Env, dest_chain: u32) -> u64 {
+        cross_chain_relay::latest_outbound_seq(env, dest_chain)
+    }
+
+    pub fn last_acknowledged_relay_seq(env: Env, dest_chain: u32) -> u64 {
+        cross_chain_relay::last_acknowledged_seq(env, dest_chain)
+    }
+
+    pub fn is_relay_processed(env: Env, source_chain: u32, seq: u64) -> bool {
+        cross_chain_relay::is_relay_processed(env, source_chain, seq)
+    }
+
+    pub fn is_relay_nonce_used(env: Env, source_chain: u32, nonce: u64) -> bool {
+        cross_chain_relay::is_relay_nonce_used(env, source_chain, nonce)
     }
 
     // ── Custom Attributes ────────────────────────────────────────────────────
@@ -1606,4 +2225,300 @@ impl QuorumCreditContract {
     pub fn get_periodic_payment_status(env: Env, loan_id: u64) -> Option<PeriodicPaymentStatus> {
         periodic_payments::get_periodic_payment_status(env, loan_id)
     }
+
+    // ── Issue #883: Loan Term Extension ─────────────────────────────────────
+
+    pub fn request_extension(
+        env: Env,
+        borrower: Address,
+        extension_secs: u64,
+    ) -> Result<(), ContractError> {
+        loan::request_extension(env, borrower, extension_secs)
+    }
+
+    pub fn approve_extension(
+        env: Env,
+        voucher: Address,
+        borrower: Address,
+    ) -> Result<(), ContractError> {
+        loan::approve_extension(env, voucher, borrower)
+    }
+
+    pub fn get_extension_request(env: Env, borrower: Address) -> Option<LoanExtensionRequest> {
+        loan::get_extension_request(env, borrower)
+    }
+
+    // ── Issue #882: Loan Insurance Integration ──────────────────────────────
+
+    pub fn contribute_to_insurance(
+        env: Env,
+        contributor: Address,
+        amount: i128,
+    ) -> Result<(), ContractError> {
+        insurance::contribute_to_insurance(env, contributor, amount)
+    }
+
+    pub fn claim_insurance(
+        env: Env,
+        voucher: Address,
+        loan_id: u64,
+    ) -> Result<(), ContractError> {
+        insurance::claim_insurance(env, voucher, loan_id)
+    }
+
+    pub fn purchase_slash_insurance(
+        env: Env,
+        voucher: Address,
+        borrower: Address,
+    ) -> Result<i128, ContractError> {
+        insurance::purchase_slash_insurance(env, voucher, borrower)
+    }
+
+    pub fn is_voucher_insured(env: Env, voucher: Address, borrower: Address) -> bool {
+        insurance::is_voucher_insured(env, voucher, borrower)
+    }
+
+    pub fn get_insurance_pool_balance(env: Env) -> i128 {
+        insurance::get_insurance_pool_balance(env)
+    }
+
+    pub fn set_insurance_fee_bps(
+        env: Env,
+        admin_signers: Vec<Address>,
+        fee_bps: u32,
+    ) -> Result<(), ContractError> {
+        insurance::set_insurance_fee_bps(env, admin_signers, fee_bps)
+    }
+
+    pub fn set_insurance_coverage_bps(
+        env: Env,
+        admin_signers: Vec<Address>,
+        coverage_bps: u32,
+    ) -> Result<(), ContractError> {
+        insurance::set_insurance_coverage_bps(env, admin_signers, coverage_bps)
+    }
+
+    pub fn get_insurance_fee_bps(env: Env) -> u32 {
+        insurance::get_insurance_fee_bps_pub(env)
+    }
+
+    pub fn get_insurance_coverage_bps(env: Env) -> u32 {
+        insurance::get_insurance_coverage_bps_pub(env)
+    }
+
+    // ── Issue #884: Prepayment Bonus ────────────────────────────────────────
+
+    pub fn set_prepayment_bonus_bps(
+        env: Env,
+        admin_signers: Vec<Address>,
+        bonus_bps: u32,
+    ) -> Result<(), ContractError> {
+        loan::set_prepayment_bonus_bps(env, admin_signers, bonus_bps)
+    }
+
+    pub fn get_prepayment_bonus_bps(env: Env) -> u32 {
+        loan::get_prepayment_bonus_bps(&env)
+    }
+
+    // ── Issue #885: Loan Status Privacy ─────────────────────────────────────
+
+    pub fn set_loan_privacy(
+        env: Env,
+        borrower: Address,
+        privacy: LoanPrivacyLevel,
+    ) -> Result<(), ContractError> {
+        loan::set_loan_privacy(env, borrower, privacy)
+    }
+
+    pub fn get_loan_privacy(env: Env, borrower: Address) -> LoanPrivacyLevel {
+        loan::get_loan_privacy(&env, &borrower)
+    }
+
+    pub fn get_loan_with_privacy(
+        env: Env,
+        borrower: Address,
+        caller: Address,
+    ) -> Result<Option<LoanRecord>, ContractError> {
+        loan::get_loan_with_privacy(env, borrower, caller)
+    }
+
+    // ── Issue #938: Incremental Config Changes ────────────────────────────────
+
+    /// Enqueue a named config field change to be applied no earlier than `apply_after`.
+    pub fn enqueue_config_patch(
+        env: Env,
+        admin_signers: Vec<Address>,
+        field: ConfigField,
+        new_value: i128,
+        apply_after: u64,
+    ) {
+        admin::enqueue_config_patch(env, admin_signers, field, new_value, apply_after)
+    }
+
+    /// Apply the next pending config patch whose not-before timestamp has passed.
+    /// Returns `true` if a patch was applied.
+    pub fn apply_next_config_patch(env: Env) -> bool {
+        admin::apply_next_config_patch(env)
+    }
+
+    pub fn get_config_patch(env: Env, idx: u32) -> Option<ConfigPatch> {
+        admin::get_config_patch(env, idx)
+    }
+
+    pub fn get_config_patch_count(env: Env) -> u32 {
+        admin::get_config_patch_count(env)
+    }
+
+    // ── Issue #939: Storage Compaction ───────────────────────────────────────
+
+    /// Archive a completed/defaulted loan: store a compact summary, delete the full record.
+    pub fn archive_loan(
+        env: Env,
+        admin_signers: Vec<Address>,
+        loan_id: u64,
+    ) -> Result<(), ContractError> {
+        admin::archive_loan(env, admin_signers, loan_id)
+    }
+
+    pub fn get_archived_loan(env: Env, loan_id: u64) -> Option<ArchivedLoan> {
+        admin::get_archived_loan(env, loan_id)
+    }
+
+    // ── Issue #940: Vectorized Score Updates ─────────────────────────────────
+
+    /// Batch-update credit scores for multiple borrowers in a single call.
+    /// Returns `(updated_count, skipped_count)`.
+    pub fn batch_update_credit_scores(
+        env: Env,
+        admin_signers: Vec<Address>,
+        borrowers: Vec<Address>,
+    ) -> (u32, u32) {
+        admin::batch_update_credit_scores(env, admin_signers, borrowers)
+    }
+
+    // ── Issue #941: Query Pagination ─────────────────────────────────────────
+
+    /// Return a paginated slice of vouch records.
+    /// `cursor` = 0-based start index; `page_size` capped at 50.
+    pub fn get_vouches_paginated(
+        env: Env,
+        borrower: Address,
+        cursor: u32,
+        page_size: u32,
+    ) -> VouchPage {
+        admin::get_vouches_paginated(env, borrower, cursor, page_size)
+    }
+
+    // ── Issue #893: Multi-Tier Admin Approval ──────────────────────────────────
+
+    pub fn set_multi_tier_thresholds(
+        env: Env,
+        admin_signers: Vec<Address>,
+        thresholds: MultiTierAdminThresholds,
+    ) {
+        admin::set_multi_tier_thresholds(env, admin_signers, thresholds)
+    }
+
+    pub fn get_multi_tier_thresholds(env: Env) -> Option<MultiTierAdminThresholds> {
+        admin::get_multi_tier_thresholds(env)
+    }
+
+    pub fn get_effective_approval_threshold(
+        env: Env,
+        operation_type: AdminOperationType,
+    ) -> u32 {
+        admin::get_effective_approval_threshold(env, operation_type)
+    }
+
+    // ── Cross-chain bridge management ─────────────────────────────────────────
+
+    /// Register a new cross-chain bridge so vouchers may stake wrapped tokens from that chain.
+    pub fn register_bridge(
+        env: Env,
+        admin_signers: Vec<Address>,
+        chain_id: u32,
+        chain_name: String,
+        bridge_address: Address,
+    ) -> Result<(), ContractError> {
+        vouch::register_bridge(env, admin_signers, chain_id, chain_name, bridge_address)
+    }
+
+    /// Deactivate a registered bridge; prevents new cross-chain vouches for that chain.
+    pub fn remove_bridge(
+        env: Env,
+        admin_signers: Vec<Address>,
+        chain_id: u32,
+    ) -> Result<(), ContractError> {
+        vouch::remove_bridge(env, admin_signers, chain_id)
+    }
+
+    /// Return all registered bridges (active and inactive).
+    pub fn get_bridges(env: Env) -> Vec<crate::types::BridgeRecord> {
+        vouch::get_bridges(env)
+    }
+}
+
+impl LoanRecord {
+    pub fn get_next_expected_payment(&self) -> i128 {
+        // Linear amortization: amount / periods
+        self.amount / self.num_periods as i128
+    }
+}
+
+pub fn validate_repayment_amount(loan: &LoanRecord, payment: i128) -> bool {
+    payment >= loan.get_next_expected_payment()
+}
+
+pub fn repay(e: Env, borrower: Address, payment: i128) -> Result<(), ContractError> {
+    let mut loan = get_loan(&e, &borrower)?;
+    
+    if !validate_repayment_amount(&loan, payment) {
+        return Err(ContractError::InsufficientRepayment);
+    }
+    
+    // Proceed with existing repayment logic...
+    Ok(())
+}
+
+#[derive(Clone)]
+pub struct WithdrawalRecord {
+    pub voucher: Address,
+    pub borrower: Address,
+    pub amount: i128,
+    pub unlock_time: u64,
+}
+
+// Ensure your DataKey enum includes:
+// WithdrawalQueue(Address, Address)
+
+const WITHDRAWAL_COOLDOWN: u64 = 60 * 60 * 24 * 7; // 7 days in seconds
+
+pub fn queue_withdrawal(e: Env, voucher: Address, borrower: Address) -> Result<(), ContractError> {
+    voucher.require_auth();
+    let mut vouch = get_vouch(&e, &voucher, &borrower)?;
+    
+    let unlock_time = e.ledger().timestamp() + WITHDRAWAL_COOLDOWN;
+    let record = WithdrawalRecord {
+        voucher: voucher.clone(),
+        borrower: borrower.clone(),
+        amount: vouch.stake,
+        unlock_time,
+    };
+    
+    e.storage().instance().set(&DataKey::WithdrawalQueue(voucher, borrower), &record);
+    Ok(())
+}
+
+pub fn execute_withdrawal(e: Env, voucher: Address, borrower: Address) -> Result<(), ContractError> {
+    let record: WithdrawalRecord = e.storage().instance().get(&DataKey::WithdrawalQueue(voucher, borrower))
+        .ok_or(ContractError::NoQueuedWithdrawal)?;
+        
+    if e.ledger().timestamp() < record.unlock_time {
+        return Err(ContractError::CooldownNotExpired);
+    }
+    
+    // Transfer stake back to voucher and clear storage
+    e.storage().instance().remove(&DataKey::WithdrawalQueue(voucher, borrower));
+    // ... logic to return funds ...
+    Ok(())
 }

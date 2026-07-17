@@ -1,30 +1,179 @@
-﻿use crate::errors::ContractError;
+use crate::errors::ContractError;
 use crate::helpers::{
     add_slash_balance, config, get_active_loan_record, get_latest_loan_record, has_active_loan,
-    require_admin_approval, require_governance_participant, require_not_paused,
+    is_zero_address, require_admin_approval, require_governance_participant, require_not_paused,
 };
 use crate::types::{
-    AppealStatus, DataKey, LoanStatus, PendingSlashRecord, SlashEscrowAppealRecord, SlashEscrow,
-    SlashRecord, SlashThresholdProposal, SlashVoteRecord, TimelockAction, TimelockProposal,
-    VouchRecord, BPS_DENOMINATOR, APPEAL_OVERRIDE_QUORUM_BPS, SLASH_APPEAL_PERIOD,
+    AdminRemovalProposal, AppealStatus, DataKey, LoanStatus, PendingSlashRecord,
+    SlashAppealRecord, SlashEscrowAppealRecord, SlashEscrow,
+    SlashingReportRecord, SlashRecord, SlashThresholdProposal, SlashVoteRecord,
+    TimelockAction, TimelockProposal,
+    VouchRecord, BPS_DENOMINATOR, APPEAL_OVERRIDE_QUORUM_BPS, MONTHLY_PERIOD_SECS,
+    SLASH_APPEAL_PERIOD,
 };
-use soroban_sdk::{panic_with_error, symbol_short, Address, Env, Vec};
+use soroban_sdk::{panic_with_error, symbol_short, Address, Env, String, Vec};
 
-/// Default quorum: 50% of total vouched stake must approve.
-const DEFAULT_SLASH_VOTE_QUORUM_BPS: u32 = 5_000;
+/// Issue #1069: Resolve the effective voter for a voucher, following delegation chain.
+/// Returns the final delegate if one exists, otherwise the original voucher.
+pub fn resolve_vote_delegation(env: &Env, voucher: &Address) -> Address {
+    let mut current = voucher.clone();
+    let mut visited: Vec<Address> = Vec::new(env);
+    visited.push_back(current.clone());
+    
+    // Follow delegation chain (max 10 hops to prevent infinite loops)
+    for _ in 0..10 {
+        if let Some(delegate) = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VoteDelegation(current.clone()))
+        {
+            // Check for circular delegation
+            if visited.iter().any(|a| a == &delegate) {
+                break;
+            }
+            current = delegate;
+            visited.push_back(current.clone());
+        } else {
+            break;
+        }
+    }
+    
+    current
+}
+
+/// Issue #1069: Get the effective stake for a voucher, considering delegation.
+/// If the voucher has delegated their vote, returns 0 (delegate votes with their own stake).
+/// Otherwise returns the voucher's actual stake.
+pub fn get_effective_vote_stake(
+    env: &Env,
+    voucher: &Address,
+    borrower: &Address,
+) -> Result<i128, ContractError> {
+    let vouches: Vec<VouchRecord> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Vouches(borrower.clone()))
+        .unwrap_or(Vec::new(env));
+    
+    let vouch_rec = vouches
+        .iter()
+        .find(|v| v.voucher == *voucher)
+        .ok_or(ContractError::VoucherNotFound)?;
+    
+    // Check if this voucher has delegated their vote
+    let effective_voter = resolve_vote_delegation(env, voucher);
+    
+    // If the effective voter is different from this voucher, this voucher's stake
+    // is counted under the delegate's vote, not their own
+    if effective_voter != *voucher {
+        Ok(0)
+    } else {
+        Ok(vouch_rec.stake)
+    }
+}
 
 /// Cast a governance vote on whether `borrower` should be slashed.
 ///
 /// - Only active vouchers (those with a stake in `Vouches(borrower)`) may vote.
 /// - Votes are weighted by the voucher's current stake.
 /// - When `approve_stake * BPS_DENOMINATOR / total_stake >= quorum_bps`, slash is auto-executed.
-pub fn vote_slash(
+/// Issue #1069: Delegate vote to another address for governance votes.
+/// The delegate can vote on behalf of the voucher with the voucher's stake.
+pub fn delegate_vote(
     env: Env,
     voucher: Address,
+    delegate: Address,
+) -> Result<(), ContractError> {
+    voucher.require_auth();
+    require_not_paused(&env)?;
+
+    if voucher == delegate {
+        return Err(ContractError::InvalidStateTransition);
+    }
+
+    // Check for circular delegation
+    let mut visited: Vec<Address> = Vec::new(&env);
+    visited.push_back(voucher.clone());
+    
+    let mut current = delegate.clone();
+    for _ in 0..10 {
+        if current == voucher {
+            return Err(ContractError::CircularDelegation);
+        }
+        
+        if let Some(next_delegate) = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VoteDelegation(current.clone()))
+        {
+            if visited.iter().any(|a| a == &next_delegate) {
+                break;
+            }
+            visited.push_back(next_delegate.clone());
+            current = next_delegate;
+        } else {
+            break;
+        }
+    }
+
+    // Store the delegation
+    env.storage()
+        .persistent()
+        .set(&DataKey::VoteDelegation(voucher.clone()), &delegate);
+
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("delegated")),
+        (voucher, delegate),
+    );
+
+    Ok(())
+}
+
+/// Issue #1069: Revoke a previously delegated vote.
+pub fn revoke_vote_delegation(
+    env: Env,
+    voucher: Address,
+) -> Result<(), ContractError> {
+    voucher.require_auth();
+    require_not_paused(&env)?;
+
+    // Check if delegation exists
+    if env
+        .storage()
+        .persistent()
+        .get::<DataKey, Address>(&DataKey::VoteDelegation(voucher.clone()))
+        .is_none()
+    {
+        return Err(ContractError::DelegationNotFound);
+    }
+
+    // Remove the delegation
+    env.storage()
+        .persistent()
+        .remove(&DataKey::VoteDelegation(voucher.clone()));
+
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("revoked")),
+        (voucher,),
+    );
+
+    Ok(())
+}
+
+/// Issue #1069: Get the delegate for a voucher, if any.
+pub fn get_vote_delegate(env: Env, voucher: Address) -> Option<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::VoteDelegation(voucher))
+}
+
+pub fn vote_slash(
+    env: Env,
+    voter: Address,
     borrower: Address,
     approve: bool,
 ) -> Result<(), ContractError> {
-    voucher.require_auth();
+    voter.require_auth();
     require_not_paused(&env)?;
 
     // Check for an already-executed vote first (before the active-loan guard).
@@ -40,6 +189,8 @@ pub fn vote_slash(
 
     let cfg = config(&env);
     let now = env.ledger().timestamp();
+
+    // Enforce slash cooldown (time since last *executed* slash).
     if cfg.slash_cooldown_seconds > 0 {
         if let Some(last) = env
             .storage()
@@ -66,20 +217,48 @@ pub fn vote_slash(
         return Err(ContractError::NoActiveLoan);
     }
 
-    // Fetch vouches and find this voucher's stake.
+    // Fetch vouches and find all stakes the voter is eligible to cast (own stake + delegated stake).
     let vouches: Vec<VouchRecord> = env
         .storage()
         .persistent()
         .get(&DataKey::Vouches(borrower.clone()))
         .unwrap_or(Vec::new(&env));
 
+    // Issue #1069: Resolve delegation - if this voucher has delegated, the delegate votes with this stake
+    let effective_voter = resolve_vote_delegation(&env, &voucher);
+    let actual_voter = if effective_voter != voucher {
+        // This voucher's stake is counted under the delegate's vote
+        // The delegate should call vote_slash separately
+        return Ok(()); // Silently succeed - delegate will vote
+    } else {
+        voucher.clone()
+    };
+
     let voucher_stake = vouches
         .iter()
-        .find(|v| v.voucher == voucher)
+        .find(|v| v.voucher == actual_voter)
         .map(|v| v.stake)
         .ok_or(ContractError::VoucherNotFound)?;
 
-    let total_stake: i128 = vouches.iter().map(|v| v.stake).sum();
+    // Issue #1069: Calculate total stake including delegated votes
+    // For each delegate, sum up their own stake plus all delegated stakes
+    let mut total_stake: i128 = 0;
+    let mut effective_stake: i128 = voucher_stake;
+    
+    for v in vouches.iter() {
+        let voter = resolve_vote_delegation(&env, &v.voucher);
+        if voter == v.voucher {
+            // This voucher votes for themselves
+            total_stake += v.stake;
+        } else if voter == actual_voter {
+            // This voucher's stake is delegated to the actual voter
+            effective_stake += v.stake;
+            total_stake += v.stake;
+        } else {
+            // Delegated to someone else, still counts in total
+            total_stake += v.stake;
+        }
+    }
 
     // Load or initialise the vote record.
     let mut vote: SlashVoteRecord = env
@@ -95,6 +274,7 @@ pub fn vote_slash(
 
     if vote.executed {
         if has_active_loan(&env, &borrower) {
+            // This is a fresh loan — reset the vote record for the new proposal.
             vote = SlashVoteRecord {
                 approve_stake: 0,
                 reject_stake: 0,
@@ -106,31 +286,31 @@ pub fn vote_slash(
         }
     }
 
-    // Prevent double-voting.
-    if vote.voters.iter().any(|v| v == voucher) {
+    // Prevent double-voting by the effective voter.
+    if vote.voters.iter().any(|v| resolve_vote_delegation(&env, v) == actual_voter) {
         return Err(ContractError::AlreadyVoted);
     }
 
     if approve {
-        vote.approve_stake = vote.approve_stake.checked_add(voucher_stake).ok_or(ContractError::ArithmeticError)?;
+        vote.approve_stake = vote.approve_stake.checked_add(effective_stake).ok_or(ContractError::ArithmeticError)?;
     } else {
-        vote.reject_stake = vote.reject_stake.checked_add(voucher_stake).ok_or(ContractError::ArithmeticError)?;
+        vote.reject_stake = vote.reject_stake.checked_add(effective_stake).ok_or(ContractError::ArithmeticError)?;
     }
-    vote.voters.push_back(voucher.clone());
+    vote.voters.push_back(actual_voter.clone());
 
     env.events().publish(
         (symbol_short!("gov"), symbol_short!("voted")),
-        (voucher.clone(), borrower.clone(), approve, voucher_stake),
+        (actual_voter.clone(), borrower.clone(), approve, effective_stake),
     );
 
-    // Check quorum.
+    // Check quorum using the effective total stake.
     let quorum_bps: u32 = env
         .storage()
         .instance()
         .get(&DataKey::SlashVoteQuorum)
         .unwrap_or(DEFAULT_SLASH_VOTE_QUORUM_BPS);
 
-    // Use ceiling division to prevent rounding down: (approve_stake * BPS_DENOMINATOR + total_stake - 1) / total_stake
+    // Use ceiling division to prevent rounding down
     let quorum_reached = total_stake > 0
         && (vote.approve_stake.checked_mul(BPS_DENOMINATOR).ok_or(ContractError::ArithmeticError)?
             .checked_add(total_stake).ok_or(ContractError::ArithmeticError)?
@@ -142,23 +322,23 @@ pub fn vote_slash(
         env.storage()
             .persistent()
             .set(&DataKey::SlashVote(borrower.clone()), &vote);
-        
+
         // Instead of immediately executing, create a pending slash record
         let cfg = config(&env);
         let now = env.ledger().timestamp();
         let executable_at = now + cfg.slash_delay_seconds;
-        
+
         let pending_slash = PendingSlashRecord {
             borrower: borrower.clone(),
             approved_at: now,
             executable_at,
             executed: false,
         };
-        
+
         env.storage()
             .persistent()
             .set(&DataKey::PendingSlashExecution(borrower.clone()), &pending_slash);
-        
+
         env.events().publish(
             (symbol_short!("gov"), symbol_short!("slsh_pend")),
             (borrower.clone(), now, executable_at),
@@ -199,6 +379,7 @@ pub fn get_slash_vote_quorum(env: Env) -> u32 {
 
 /// Execute a slash vote if quorum has been met.
 /// Anyone can call this function to execute a slash once quorum is reached.
+/// Requires approximately 2/3 (6667 bps) of total vouched stake to have approved.
 pub fn execute_slash_vote(env: Env, borrower: Address) -> Result<(), ContractError> {
     require_not_paused(&env)?;
 
@@ -220,11 +401,20 @@ pub fn execute_slash_vote(env: Env, borrower: Address) -> Result<(), ContractErr
         .unwrap_or(Vec::new(&env));
     let total_stake: i128 = vouches.iter().map(|v| v.stake).sum();
 
-    // Retrieve quorum threshold
-    let quorum_bps: u32 = get_slash_vote_quorum(env.clone());
+    // Retrieve quorum threshold (default ≈ 66.67%)
+    let quorum_bps: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::SlashVoteQuorum)
+        .unwrap_or(DEFAULT_SLASH_VOTE_QUORUM_BPS);
 
-    // Calculate required quorum stake
-    let quorum_stake = total_stake * quorum_bps as i128 / 10_000;
+    // Calculate required quorum stake using ceiling division
+    let quorum_stake = (total_stake
+        .checked_mul(quorum_bps as i128)
+        .unwrap_or(i128::MAX)
+        .checked_add(BPS_DENOMINATOR - 1)
+        .unwrap_or(i128::MAX))
+        / BPS_DENOMINATOR;
 
     // Check if approval stake meets quorum
     if vote.approve_stake < quorum_stake {
@@ -383,13 +573,9 @@ fn execute_slash(env: &Env, borrower: &Address) -> Result<(), ContractError> {
     // Calculate total stake backing this borrower (used for loan-size scaling)
     let total_stake: i128 = vouches.iter().map(|v| v.stake).sum();
 
-    // Determine the effective slash rate, factoring in loan size and/or protocol health
-    let effective_slash_bps =
-        crate::helpers::calculate_effective_slash_bps(env, loan.amount, total_stake);
-
-    let mut total_slashed: i128 = 0;
-    let mut remaining_vouches: Vec<VouchRecord> = Vec::new(env);
-    // Calculate effective slash basis points based on default count (graduated penalties)
+    // Calculate effective slash basis points based on default count (graduated penalties).
+    // Note: the dynamic-health calculation is intentionally not used here —
+    // the graduated default_count logic is the authoritative rate for execute_slash.
     let default_count: u32 = env
         .storage()
         .persistent()
@@ -401,8 +587,16 @@ fn execute_slash(env: &Env, borrower: &Address) -> Result<(), ContractError> {
         effective_slash_bps = 10_000;
     }
 
+    let mut total_slashed: i128 = 0;
+    let mut remaining_vouches: Vec<VouchRecord> = Vec::new(env);
+
     for v in vouches.iter() {
         if v.token != loan.token_address {
+            // Return non-matching-token vouches in full to their owner.
+            if !is_zero_address(env, &v.token) {
+                let other_token = soroban_sdk::token::Client::new(env, &v.token);
+                other_token.transfer(&env.current_contract_address(), &v.voucher, &v.stake);
+            }
             remaining_vouches.push_back(v);
             continue;
         }
@@ -509,6 +703,52 @@ fn execute_slash(env: &Env, borrower: &Address) -> Result<(), ContractError> {
 
 /// Propose a slash action with a delay before execution.
 /// This implements the "confirmation window" for the slash action.
+
+/// Queue a slash operation for deferred batch execution (Issue #937: Lazy Slash).
+/// This allows multiple slashes to be batched together, reducing gas costs.
+pub fn queue_slash(env: Env, borrower: Address, slash_amount: i128) -> Result<(), ContractError> {
+    require_admin_approval(&env, &Vec::new(&env));
+    
+    // Calculate slash amount from existing vouch stake if not provided
+    let actual_slash = if slash_amount > 0 {
+        slash_amount
+    } else {
+        let vouches: Vec<VouchRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Vouches(borrower.clone()))
+            .unwrap_or(Vec::new(&env));
+        
+        let total_stake: i128 = vouches.iter().map(|v| v.stake).sum();
+        let cfg = config(&env);
+        total_stake.checked_mul(cfg.slash_bps).ok_or(ContractError::ArithmeticError)? / BPS_DENOMINATOR
+    };
+    
+    crate::lazy_slash::queue_slash(&env, borrower.clone(), actual_slash)?;
+    
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("slashqd")),
+        (borrower.clone(), actual_slash),
+    );
+    
+    Ok(())
+}
+
+/// Execute all queued slash operations in a single batch (Issue #937: Lazy Slash).
+/// Returns the number of slashes executed.
+pub fn execute_queued_slashes(env: Env) -> Result<u32, ContractError> {
+    require_admin_approval(&env, &Vec::new(&env));
+    
+    let executed = crate::lazy_slash::execute_queued_slashes(&env)?;
+    
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("slashqexc")),
+        (executed,),
+    );
+    
+    Ok(executed)
+}
+
 pub fn propose_slash(
     env: Env,
     proposer: Address,
@@ -1256,11 +1496,11 @@ pub fn appeal_slash(
 /// Once 2/3 quorum is reached, appeal is automatically approved.
 pub fn vote_appeal(
     env: Env,
-    voucher: Address,
+    voter: Address,
     borrower: Address,
     approve: bool,
 ) -> Result<(), ContractError> {
-    voucher.require_auth();
+    voter.require_auth();
     require_not_paused(&env)?;
 
     let now = env.ledger().timestamp();
@@ -1288,12 +1528,6 @@ pub fn vote_appeal(
         .get(&DataKey::Vouches(borrower.clone()))
         .unwrap_or(Vec::new(&env));
 
-    let voucher_stake = vouches
-        .iter()
-        .find(|v| v.voucher == voucher)
-        .map(|v| v.stake)
-        .ok_or(ContractError::VoucherNotFound)?;
-
     let total_stake: i128 = vouches.iter().map(|v| v.stake).sum();
 
     // Load appeal record
@@ -1303,29 +1537,44 @@ pub fn vote_appeal(
         .get(&DataKey::SlashEscrowAppeal(borrower.clone()))
         .ok_or(ContractError::AppealNotFound)?;
 
-    // Prevent double voting
-    if appeal.voters.iter().any(|v| v == &voucher) {
-        return Err(ContractError::AppealAlreadyVoted);
+    let mut voting_stake = 0;
+    let mut newly_voted_vouches: Vec<Address> = Vec::new(&env);
+
+    for v in vouches.iter() {
+        // Voter can vote if they are the original voucher OR the designated delegate
+        if v.voucher == voter || v.delegate == Some(voter.clone()) {
+            // Prevent double voting
+            if !appeal.voters.iter().any(|already_voted| already_voted == v.voucher) {
+                voting_stake = voting_stake.checked_add(v.stake).ok_or(ContractError::ArithmeticError)?;
+                newly_voted_vouches.push_back(v.voucher.clone());
+            }
+        }
+    }
+
+    if voting_stake == 0 {
+        return Err(ContractError::VoucherNotFound);
     }
 
     // Record vote
     if approve {
         appeal.approve_stake = appeal
             .approve_stake
-            .checked_add(voucher_stake)
+            .checked_add(voting_stake)
             .ok_or(ContractError::ArithmeticError)?;
     } else {
         appeal.reject_stake = appeal
             .reject_stake
-            .checked_add(voucher_stake)
+            .checked_add(voting_stake)
             .ok_or(ContractError::ArithmeticError)?;
     }
 
-    appeal.voters.push_back(voucher.clone());
+    for v_addr in newly_voted_vouches {
+        appeal.voters.push_back(v_addr);
+    }
 
     env.events().publish(
         (symbol_short!("app"), symbol_short!("voted")),
-        (voucher.clone(), borrower.clone(), approve, voucher_stake),
+        (voter.clone(), borrower.clone(), approve, voting_stake),
     );
 
     // Check if 2/3 quorum is reached
@@ -1457,6 +1706,519 @@ fn finalize_appeal_internal(
     env.events().publish(
         (symbol_short!("app"), symbol_short!("finalized")),
         (borrower.clone(), is_auto_finalize),
+    );
+
+    Ok(())
+}
+
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Issue #903: Risk Assessment Voting
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Propose a new risk threshold configuration.
+pub fn propose_risk_threshold(
+    env: Env,
+    proposer: Address,
+    min_risk_threshold: u32,
+    max_risk_threshold: u32,
+) -> Result<u64, ContractError> {
+    proposer.require_auth();
+    require_not_paused(&env)?;
+
+    // Validate thresholds
+    if min_risk_threshold >= max_risk_threshold {
+        panic_with_error!(&env, ContractError::InvalidAmount);
+    }
+
+    let proposal_id: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::RiskThresholdCounter)
+        .unwrap_or(0u64)
+        .checked_add(1)
+        .expect("proposal ID overflow");
+
+    let proposal = crate::types::RiskThresholdProposal {
+        id: proposal_id,
+        proposer: proposer.clone(),
+        min_risk_threshold,
+        max_risk_threshold,
+        votes_for: 0,
+        votes_against: 0,
+        status: crate::types::GovernanceProposalStatus::Pending,
+        created_at: env.ledger().timestamp(),
+        eta: env.ledger().timestamp() + 86400,  // 24 hours
+    };
+
+    env.storage()
+        .instance()
+        .set(&DataKey::RiskThresholdProposal(proposal_id), &proposal);
+    env.storage()
+        .instance()
+        .set(&DataKey::RiskThresholdCounter, &proposal_id);
+
+    env.events().publish(
+        (symbol_short!("risk"), symbol_short!("proposed")),
+        (proposal_id, proposer, min_risk_threshold, max_risk_threshold),
+    );
+
+    Ok(proposal_id)
+}
+
+/// Vote on a risk threshold proposal.
+pub fn vote_risk_threshold(
+    env: Env,
+    voter: Address,
+    proposal_id: u64,
+    approve: bool,
+) -> Result<(), ContractError> {
+    voter.require_auth();
+    require_not_paused(&env)?;
+
+    let mut proposal: crate::types::RiskThresholdProposal = env
+        .storage()
+        .instance()
+        .get(&DataKey::RiskThresholdProposal(proposal_id))
+        .ok_or(ContractError::NoActiveLoan)?;
+
+    let vote_weight = 1_000_i128;  // Default vote weight
+
+    if approve {
+        proposal.votes_for = proposal.votes_for.checked_add(vote_weight).expect("vote overflow");
+    } else {
+        proposal.votes_against = proposal
+            .votes_against
+            .checked_add(vote_weight)
+            .expect("vote overflow");
+    }
+
+    env.storage()
+        .instance()
+        .set(&DataKey::RiskThresholdVote(proposal_id, voter.clone()), &approve);
+    env.storage()
+        .instance()
+        .set(&DataKey::RiskThresholdProposal(proposal_id), &proposal);
+
+    env.events().publish(
+        (symbol_short!("risk"), symbol_short!("voted")),
+        (proposal_id, voter, approve),
+    );
+
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Issue #904: Fee Structure Voting
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Propose a new fee structure.
+pub fn propose_fee_structure(
+    env: Env,
+    proposer: Address,
+    origination_fee_bps: u32,
+    repayment_fee_bps: u32,
+    late_fee_bps: u32,
+) -> Result<u64, ContractError> {
+    proposer.require_auth();
+    require_not_paused(&env)?;
+
+    // Validate fee caps
+    if origination_fee_bps > 500 || repayment_fee_bps > 250 || late_fee_bps > 1000 {
+        panic_with_error!(&env, ContractError::InvalidAmount);
+    }
+
+    let proposal_id: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::FeeStructureCounter)
+        .unwrap_or(0u64)
+        .checked_add(1)
+        .expect("proposal ID overflow");
+
+    let proposal = crate::types::FeeStructureProposal {
+        id: proposal_id,
+        proposer: proposer.clone(),
+        origination_fee_bps,
+        repayment_fee_bps,
+        late_fee_bps,
+        votes_for: 0,
+        votes_against: 0,
+        status: crate::types::GovernanceProposalStatus::Pending,
+        created_at: env.ledger().timestamp(),
+        eta: env.ledger().timestamp() + 86400,  // 24 hours
+    };
+
+    env.storage()
+        .instance()
+        .set(&DataKey::FeeStructureProposal(proposal_id), &proposal);
+    env.storage()
+        .instance()
+        .set(&DataKey::FeeStructureCounter, &proposal_id);
+
+    env.events().publish(
+        (symbol_short!("fee"), symbol_short!("proposed")),
+        (
+            proposal_id,
+            proposer,
+            origination_fee_bps,
+            repayment_fee_bps,
+        ),
+    );
+
+    Ok(proposal_id)
+}
+
+/// Vote on a fee structure proposal.
+pub fn vote_fee_structure(
+    env: Env,
+    voter: Address,
+    proposal_id: u64,
+    approve: bool,
+) -> Result<(), ContractError> {
+    voter.require_auth();
+    require_not_paused(&env)?;
+
+    let mut proposal: crate::types::FeeStructureProposal = env
+        .storage()
+        .instance()
+        .get(&DataKey::FeeStructureProposal(proposal_id))
+        .ok_or(ContractError::NoActiveLoan)?;
+
+    let vote_weight = 1_000_i128;
+
+    if approve {
+        proposal.votes_for = proposal.votes_for.checked_add(vote_weight).expect("vote overflow");
+    } else {
+        proposal.votes_against = proposal
+            .votes_against
+            .checked_add(vote_weight)
+            .expect("vote overflow");
+    }
+
+    env.storage()
+        .instance()
+        .set(&DataKey::FeeStructureVote(proposal_id, voter.clone()), &approve);
+    env.storage()
+        .instance()
+        .set(&DataKey::FeeStructureProposal(proposal_id), &proposal);
+
+    env.events().publish(
+        (symbol_short!("fee"), symbol_short!("voted")),
+        (proposal_id, voter, approve),
+    );
+
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Issue #905: Withdrawal Timelock
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Queue a withdrawal with a timelock delay.
+pub fn queue_withdrawal(
+    env: Env,
+    voucher: Address,
+    borrower: Address,
+    amount: i128,
+    token: Address,
+    delay_secs: u64,
+) -> Result<u64, ContractError> {
+    voucher.require_auth();
+    require_not_paused(&env)?;
+
+    if amount <= 0 {
+        panic_with_error!(&env, ContractError::InsufficientFunds);
+    }
+
+    let lock_id: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::WithdrawalTimelockCounter)
+        .unwrap_or(0u64)
+        .checked_add(1)
+        .expect("lock ID overflow");
+
+    let timelock = crate::types::WithdrawalTimelock {
+        id: lock_id,
+        voucher: voucher.clone(),
+        borrower: borrower.clone(),
+        amount,
+        token: token.clone(),
+        eta: env.ledger().timestamp() + delay_secs,
+        executed: false,
+        cancelled: false,
+    };
+
+    env.storage()
+        .instance()
+        .set(&DataKey::WithdrawalTimelock(lock_id), &timelock);
+    env.storage()
+        .instance()
+        .set(&DataKey::WithdrawalTimelockCounter, &lock_id);
+
+    env.events().publish(
+        (symbol_short!("wit"), symbol_short!("queued")),
+        (lock_id, voucher, borrower, amount),
+    );
+
+    Ok(lock_id)
+}
+
+/// Execute a queued withdrawal after the timelock expires.
+pub fn execute_withdrawal(env: Env, lock_id: u64) -> Result<(), ContractError> {
+    let mut timelock: crate::types::WithdrawalTimelock = env
+        .storage()
+        .instance()
+        .get(&DataKey::WithdrawalTimelock(lock_id))
+        .ok_or(ContractError::NoActiveLoan)?;
+
+    if timelock.executed {
+        panic_with_error!(&env, ContractError::AlreadyRepaid);
+    }
+
+    if timelock.cancelled {
+        panic_with_error!(&env, ContractError::InvalidStateTransition);
+    }
+
+    if env.ledger().timestamp() < timelock.eta {
+        panic_with_error!(&env, ContractError::TimelockNotReady);
+    }
+
+    timelock.executed = true;
+
+    env.storage()
+        .instance()
+        .set(&DataKey::WithdrawalTimelock(lock_id), &timelock);
+
+    env.events().publish(
+        (symbol_short!("wit"), symbol_short!("executed")),
+        (lock_id, timelock.voucher, timelock.amount),
+    );
+
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Issue #906: Cross-Chain Proposal Sync
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Initiate a cross-chain proposal sync.
+pub fn initiate_cross_chain_sync(
+    env: Env,
+    proposer: Address,
+    source_chain: String,
+    target_chains: Vec<String>,
+    proposal_type: String,
+    proposal_data: soroban_sdk::Bytes,
+) -> Result<u64, ContractError> {
+    proposer.require_auth();
+    require_not_paused(&env)?;
+
+    if target_chains.is_empty() {
+        panic_with_error!(&env, ContractError::InvalidAmount);
+    }
+
+    let sync_id: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::CrossChainSyncCounter)
+        .unwrap_or(0u64)
+        .checked_add(1)
+        .expect("sync ID overflow");
+
+    let votes_required = target_chains.len() as u32;
+
+    let sync = crate::types::CrossChainProposalSync {
+        id: sync_id,
+        source_chain: source_chain.clone(),
+        target_chains: target_chains.clone(),
+        proposal_type: proposal_type.clone(),
+        proposal_data: proposal_data.clone(),
+        votes_required,
+        votes_received: 0,
+        status: crate::types::GovernanceProposalStatus::Pending,
+        created_at: env.ledger().timestamp(),
+        eta: env.ledger().timestamp() + 259200,  // 3 days
+    };
+
+    env.storage()
+        .instance()
+        .set(&DataKey::CrossChainProposalSync(sync_id), &sync);
+    env.storage()
+        .instance()
+        .set(&DataKey::CrossChainSyncCounter, &sync_id);
+
+    env.events().publish(
+        (symbol_short!("xchain"), symbol_short!("initiated")),
+        (sync_id, proposer, source_chain, target_chains.len()),
+    );
+
+    Ok(sync_id)
+}
+
+/// Vote on a cross-chain proposal sync from another chain.
+pub fn vote_cross_chain_sync(
+    env: Env,
+    sync_id: u64,
+    chain_id: String,
+    approve: bool,
+) -> Result<(), ContractError> {
+    require_not_paused(&env)?;
+
+    let mut sync: crate::types::CrossChainProposalSync = env
+        .storage()
+        .instance()
+        .get(&DataKey::CrossChainProposalSync(sync_id))
+        .ok_or(ContractError::NoActiveLoan)?;
+
+    if sync.status != crate::types::GovernanceProposalStatus::Pending {
+        panic_with_error!(&env, ContractError::InvalidStateTransition);
+    }
+
+    if approve {
+        sync.votes_received = sync
+            .votes_received
+            .checked_add(1)
+            .expect("vote overflow");
+
+        // Execute if quorum reached
+        if sync.votes_received >= sync.votes_required {
+            sync.status = crate::types::GovernanceProposalStatus::Approved;
+        }
+    }
+
+    env.storage()
+        .instance()
+        .set(&DataKey::CrossChainProposalSync(sync_id), &sync);
+
+    env.events().publish(
+        (symbol_short!("xchain"), symbol_short!("voted")),
+        (sync_id, chain_id, approve),
+    );
+
+    Ok(())
+}
+
+pub fn propose_config_change(
+    env: Env,
+    proposer: Address,
+    new_config: crate::types::Config,
+) -> Result<u64, ContractError> {
+    proposer.require_auth();
+    require_not_paused(&env)?;
+    let cfg = config(&env);
+    assert!(
+        cfg.admins.iter().any(|a| a == &proposer),
+        "only admins can propose config changes"
+    );
+
+    let proposal_id: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::TimelockCounter)
+        .unwrap_or(0u64)
+        .checked_add(1)
+        .expect("proposal ID overflow");
+
+    let eta = env.ledger().timestamp() + crate::types::CONFIG_TIMELOCK_SECONDS;
+
+    let proposal = TimelockProposal {
+        id: proposal_id,
+        action: TimelockAction::SetConfig(new_config),
+        proposer: proposer.clone(),
+        eta,
+        executed: false,
+        cancelled: false,
+    };
+
+    env.storage()
+        .instance()
+        .set(&DataKey::Timelock(proposal_id), &proposal);
+    env.storage()
+        .instance()
+        .set(&DataKey::TimelockCounter, &proposal_id);
+
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("config_prop")),
+        (proposal_id, proposer, eta),
+    );
+
+    Ok(proposal_id)
+}
+
+pub fn execute_config_change(env: Env, proposal_id: u64) -> Result<(), ContractError> {
+    require_not_paused(&env)?;
+
+    let mut proposal: TimelockProposal = env
+        .storage()
+        .instance()
+        .get(&DataKey::Timelock(proposal_id))
+        .ok_or(ContractError::ProposalNotFound)?;
+
+    if proposal.executed {
+        return Err(ContractError::SlashAlreadyExecuted);
+    }
+    if proposal.cancelled {
+        return Err(ContractError::ProposalNotFound);
+    }
+
+    if env.ledger().timestamp() < proposal.eta {
+        return Err(ContractError::ProposalNotFound);
+    }
+
+    const TIMELOCK_EXPIRY: u64 = 72 * 60 * 60;
+    if env.ledger().timestamp() > proposal.eta + TIMELOCK_EXPIRY {
+        return Err(ContractError::ProposalNotFound);
+    }
+
+    if let TimelockAction::SetConfig(new_config) = &proposal.action {
+        proposal.executed = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::Timelock(proposal_id), &proposal);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Config, new_config);
+
+        env.events().publish(
+            (symbol_short!("gov"), symbol_short!("config_exec")),
+            (proposal_id,),
+        );
+
+        Ok(())
+    } else {
+        Err(ContractError::ProposalNotFound)
+    }
+}
+
+pub fn cancel_config_change(
+    env: Env,
+    admin_signers: Vec<Address>,
+    proposal_id: u64,
+) -> Result<(), ContractError> {
+    require_not_paused(&env)?;
+    crate::helpers::require_admin_approval(&env, &admin_signers);
+
+    let mut proposal: TimelockProposal = env
+        .storage()
+        .instance()
+        .get(&DataKey::Timelock(proposal_id))
+        .ok_or(ContractError::ProposalNotFound)?;
+
+    if proposal.executed || proposal.cancelled {
+        return Err(ContractError::SlashAlreadyExecuted);
+    }
+
+    proposal.cancelled = true;
+    env.storage()
+        .instance()
+        .set(&DataKey::Timelock(proposal_id), &proposal);
+
+    env.events().publish(
+        (symbol_short!("gov"), symbol_short!("config_cancel")),
+        (proposal_id,),
     );
 
     Ok(())

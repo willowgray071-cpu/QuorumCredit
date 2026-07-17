@@ -4,9 +4,10 @@ use crate::helpers::{
     validate_admin_config,
 };
 use crate::types::{
-    AdminActionProposal, Config, ConfigUpdateKey, ConfigUpdateProposal, DataKey,
-    GovernanceAction, GovernanceProposal, GovernanceProposalStatus, GovernanceQueueConfig,
-    DEFAULT_GOVERNANCE_EXECUTION_WINDOW, DEFAULT_GOVERNANCE_TIMELOCK_DELAY,
+    AdminActionProposal, AdminOperationType, Config, ConfigUpdateKey, ConfigUpdateProposal,
+    DataKey, GovernanceAction, GovernanceProposal, GovernanceProposalStatus,
+    GovernanceQueueConfig, MultiTierAdminThresholds, DEFAULT_GOVERNANCE_EXECUTION_WINDOW,
+    DEFAULT_GOVERNANCE_TIMELOCK_DELAY,
 };
 use soroban_sdk::{panic_with_error, symbol_short, Address, BytesN, Env, Vec};
 
@@ -446,6 +447,82 @@ pub fn update_config(
     );
 }
 
+/// Atomically batch-update multiple protocol config parameters in a single write.
+/// Each parameter is `Option`al — only `Some` fields are updated.
+/// Requires admin multi-sig approval.
+pub fn batch_update_config(
+    env: Env,
+    admin_signers: Vec<Address>,
+    yield_bps: Option<i128>,
+    slash_bps: Option<i128>,
+    max_vouchers: Option<u32>,
+    min_loan_amount: Option<i128>,
+    loan_duration: Option<u64>,
+    max_loan_to_stake_ratio: Option<u32>,
+    grace_period: Option<u64>,
+    liquidity_mining_rate_bps: Option<u32>,
+) {
+    require_not_paused(&env).expect("contract paused");
+    require_admin_approval(&env, &admin_signers);
+
+    let mut cfg = config(&env);
+
+    if let Some(v) = yield_bps {
+        if v < 0 || v > 10_000 {
+            panic_with_error!(&env, ContractError::InvalidBps);
+        }
+        cfg.yield_bps = v;
+    }
+    if let Some(v) = slash_bps {
+        if v <= 0 || v > 10_000 {
+            panic_with_error!(&env, ContractError::InvalidAmount);
+        }
+        cfg.slash_bps = v;
+    }
+    if let Some(v) = max_vouchers {
+        if v == 0 {
+            panic_with_error!(&env, ContractError::InvalidAmount);
+        }
+        cfg.max_vouchers = v;
+    }
+    if let Some(v) = min_loan_amount {
+        if v <= 0 {
+            panic_with_error!(&env, ContractError::InvalidAmount);
+        }
+        cfg.min_loan_amount = v;
+    }
+    if let Some(v) = loan_duration {
+        if v == 0 {
+            panic_with_error!(&env, ContractError::InvalidAmount);
+        }
+        cfg.loan_duration = v;
+    }
+    if let Some(v) = max_loan_to_stake_ratio {
+        if v == 0 {
+            panic_with_error!(&env, ContractError::InvalidAmount);
+        }
+        cfg.max_loan_to_stake_ratio = v;
+    }
+    if let Some(v) = grace_period {
+        if v > cfg.loan_duration {
+            panic_with_error!(&env, ContractError::InvalidAmount);
+        }
+        cfg.grace_period = v;
+    }
+    if let Some(v) = liquidity_mining_rate_bps {
+        if v > 10_000 {
+            panic_with_error!(&env, ContractError::InvalidBps);
+        }
+        cfg.liquidity_mining_rate_bps = v;
+    }
+
+    env.storage().instance().set(&DataKey::Config, &cfg);
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("batch_cfg")),
+        (admin_signers.get(0).unwrap(), env.ledger().timestamp()),
+    );
+}
+
 /// Toggle dynamic slash threshold on/off.
 /// When enabled, slash penalties adjust based on protocol health.
 /// When disabled, uses static slash_bps from Config.
@@ -640,6 +717,44 @@ pub fn get_min_stake(env: Env) -> i128 {
         .instance()
         .get(&DataKey::MinStake)
         .unwrap_or(0)
+}
+
+/// Calculate the effective (dynamic) minimum stake for a specific borrower.
+///
+/// The dynamic minimum stake takes the admin-configured base `min_stake` and
+/// reduces it based on the borrower's credit tier. Borrowers with higher credit
+/// tiers earn a discount on the minimum stake they must provide to receive a vouch.
+///
+/// Calculation:
+/// ```
+/// effective_min_stake = base_min_stake
+///     - (base_min_stake * tier.min_stake_reduction_bps / 10_000)
+/// ```
+///
+/// If credit scoring is disabled, no `CreditScore` record exists for the borrower,
+/// or the base min_stake is 0 (no minimum enforced), the base value is returned
+/// unchanged.
+///
+/// # Arguments
+/// * `env` - Soroban environment
+/// * `borrower` - The borrower address to calculate the dynamic min stake for
+///
+/// # Returns
+/// Effective minimum stake in stroops. Returns 0 if no minimum is configured.
+pub fn get_dynamic_min_stake(env: Env, borrower: Address) -> i128 {
+    let base_min_stake: i128 = env
+        .storage()
+        .instance()
+        .get(&DataKey::MinStake)
+        .unwrap_or(0);
+
+    // If no minimum is configured, nothing to adjust.
+    if base_min_stake == 0 {
+        return 0;
+    }
+
+    // Apply credit-tier reduction when credit scoring is enabled and a score exists.
+    crate::credit_score::apply_tier_rewards_to_min_stake(&env, &borrower, base_min_stake)
 }
 
 pub fn get_max_loan_amount(env: Env) -> i128 {
@@ -1983,4 +2098,174 @@ pub fn get_governance_proposal_count(env: Env) -> u64 {
         .instance()
         .get(&DataKey::GovernanceProposalCounter)
         .unwrap_or(0u64)
+}
+
+// ── Issue #893: Multi-Tier Admin Approval ──────────────────────────────────────
+
+/// Issue #893: Set multi-tier admin approval thresholds for different operation types.
+/// Allows different admin operations to require different numbers of approvals.
+pub fn set_multi_tier_thresholds(
+    env: Env,
+    admin_signers: Vec<Address>,
+    thresholds: MultiTierAdminThresholds,
+) {
+    require_admin_approval(&env, &admin_signers);
+
+    // Validate thresholds
+    let admin_count = config(&env).admins.len() as u32;
+    assert!(
+        thresholds.standard_threshold > 0 && thresholds.standard_threshold <= admin_count,
+        "invalid standard threshold"
+    );
+    assert!(
+        thresholds.high_risk_threshold > 0 && thresholds.high_risk_threshold <= admin_count,
+        "invalid high-risk threshold"
+    );
+    assert!(
+        thresholds.critical_threshold > 0 && thresholds.critical_threshold <= admin_count,
+        "invalid critical threshold"
+    );
+
+    env.storage()
+        .instance()
+        .set(&DataKey::MultiTierAdminThresholds, &thresholds);
+
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("multi")),
+        (
+            thresholds.standard_threshold,
+            thresholds.high_risk_threshold,
+            thresholds.critical_threshold,
+        ),
+    );
+}
+
+/// Issue #893: Get the current multi-tier admin approval thresholds.
+pub fn get_multi_tier_thresholds(env: Env) -> Option<MultiTierAdminThresholds> {
+    env.storage()
+        .instance()
+        .get(&DataKey::MultiTierAdminThresholds)
+}
+
+/// Issue #893: Get the effective threshold for a specific operation type.
+pub fn get_effective_approval_threshold(
+    env: Env,
+    operation_type: AdminOperationType,
+) -> u32 {
+    let cfg = config(&env);
+
+    if let Some(multi_tier) = cfg.multi_tier_thresholds {
+        multi_tier.get_threshold(operation_type)
+    } else {
+        cfg.admin_threshold
+    }
+}
+/// Emergency admin revocation — removes a compromised admin key with N-1 approval.
+///
+/// This function allows the remaining admins to revoke a compromised key without
+/// any participation from the compromised key itself. It requires ALL other admins
+/// (i.e. N-1 of N total) to sign, providing a higher bar than the standard
+/// `admin_threshold` to prevent abuse.
+///
+/// # Arguments
+/// * `existing_admins` - All non-compromised admin addresses signing this revocation
+///   (must be every current admin except `target_admin`; must equal N-1)
+/// * `target_admin` - The compromised admin address to revoke
+/// * `reason` - Human-readable reason for the revocation (stored in the event)
+///
+/// # Errors
+/// * `AdminNotFound` - If `target_admin` is not a current admin
+/// * `AdminAlreadyRevoked` - If `target_admin` is already revoked
+/// * `UnauthorizedCaller` - If `existing_admins` count < N-1 (all non-compromised admins required)
+/// * `InvalidAdminThreshold` - If revocation would reduce admin count below 1
+pub fn revoke_admin(
+    env: Env,
+    existing_admins: Vec<Address>,
+    target_admin: Address,
+    reason: soroban_sdk::String,
+) -> Result<(), ContractError> {
+    let cfg = config(&env);
+
+    // 1. Verify target is actually a current admin
+    if !cfg.admins.iter().any(|a| a == target_admin) {
+        return Err(ContractError::AdminNotFound);
+    }
+
+    // 2. Verify target is not already revoked
+    let already_revoked: bool = env
+        .storage()
+        .persistent()
+        .get(&DataKey::RevokedAdmin(target_admin.clone()))
+        .unwrap_or(false);
+    if already_revoked {
+        return Err(ContractError::AdminAlreadyRevoked);
+    }
+
+    // 3. Compute the required N-1 threshold — every admin except the target must sign
+    let total_admins = cfg.admins.len();
+    let required = total_admins
+        .checked_sub(1)
+        .expect("no admins to revoke from");
+
+    // Must have at least 1 remaining admin after revocation
+    if required == 0 {
+        return Err(ContractError::InvalidAdminThreshold);
+    }
+
+    // 4. Validate that `existing_admins` has exactly N-1 entries,
+    //    all are real admins (not the target), and none is the target
+    if existing_admins.len() < required {
+        return Err(ContractError::UnauthorizedCaller);
+    }
+
+    for signer in existing_admins.iter() {
+        // Each signer must be a registered admin
+        if !cfg.admins.iter().any(|a| a == signer) {
+            return Err(ContractError::UnauthorizedCaller);
+        }
+        // The target cannot sign their own revocation
+        if signer == target_admin {
+            return Err(ContractError::UnauthorizedCaller);
+        }
+        // Collect Soroban auth from each signer
+        signer.require_auth();
+    }
+
+    // 5. Remove target from the active admin list in Config
+    let mut updated_cfg = cfg;
+    let idx = updated_cfg
+        .admins
+        .iter()
+        .position(|a| a == target_admin)
+        .expect("target admin must be in list") as u32;
+    updated_cfg.admins.remove(idx);
+
+    // 6. Adjust threshold if it now exceeds the remaining admin count
+    if updated_cfg.admin_threshold > updated_cfg.admins.len() {
+        updated_cfg.admin_threshold = updated_cfg.admins.len();
+    }
+
+    // 7. Persist config and mark admin as revoked in persistent storage
+    env.storage()
+        .instance()
+        .set(&DataKey::Config, &updated_cfg);
+    env.storage()
+        .persistent()
+        .set(&DataKey::RevokedAdmin(target_admin.clone()), &true);
+
+    // 8. Emit revocation event with reason
+    env.events().publish(
+        (symbol_short!("admin"), symbol_short!("revoked")),
+        (target_admin, reason, env.ledger().timestamp()),
+    );
+
+    Ok(())
+}
+
+/// Check whether an address has been emergency-revoked.
+pub fn is_admin_revoked(env: Env, admin: Address) -> bool {
+    env.storage()
+        .persistent()
+        .get::<DataKey, bool>(&DataKey::RevokedAdmin(admin))
+        .unwrap_or(false)
 }

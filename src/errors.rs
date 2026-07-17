@@ -75,7 +75,9 @@ pub enum ContractError {
     /// No escrow record found for this borrower (#666/#667).
     NoEscrowFound = 56,
     /// No slash record found for the given slash ID.
-    SlashRecordNotFound = 57,
+    SlashRecordNotFound = 142,
+    /// Refinancing was attempted without any outstanding balance to settle.
+    RefinanceNoOutstanding = 143,
     /// Slash has already been reversed and cannot be reversed again.
     SlashAlreadyReversed = 58,
     /// Caller has exceeded the configured rate limit.
@@ -88,6 +90,22 @@ pub enum ContractError {
     ArithmeticError = 62,
     /// No rollback snapshot found for the requested deployment index (#744).
     RollbackSnapshotNotFound = 63,
+    /// Admin address is not on the whitelist.
+    AdminNotWhitelisted = 64,
+    /// Admin address is on the blacklist.
+    AdminBlacklisted = 65,
+    /// Reentrancy detected — a guarded function was re-entered before the lock was released.
+    Reentrancy = 66,
+    /// Borrower is immune from being slashed (e.g. repaid within grace period).
+    BorrowerImmune = 67,
+    /// Target admin has already been revoked and cannot be revoked again.
+    AdminAlreadyRevoked = 68,
+    /// The target of revocation is not a current admin.
+    AdminNotFound = 69,
+    /// The chain_id used in a cross-chain vouch is not registered or is inactive.
+    InvalidChain = 98,
+    /// A bridge for this chain_id has already been registered.
+    BridgeAlreadyRegistered = 99,
     /// No Ed25519 verification key is configured for the origin chain.
     BridgeNotConfigured = 100,
     /// The origin/destination chain combination is invalid.
@@ -151,6 +169,49 @@ AppealAlreadyVoted = 128,
 /// Appeal quorum (2/3 voucher stake) not met to overturn slash.
 AppealQuorumNotMet = 129,
 /// Escrow period has expired; appeal can no longer be filed or voted on.
-    EscrowExpired = 130,
-    AttributeNotFound = 131,
+EscrowExpired = 130,
+/// Emergency cooldown bypass is not authorised for this voucher.
+EmergencyBypassNotAuthorised = 131,
+/// Cooldown bypass request already exists for this (borrower, voucher) pair.
+CooldownBypassAlreadyRequested = 143,
+/// Cooldown bypass request not found.
+CooldownBypassNotFound = 144,
+/// Cooldown bypass has already been approved.
+CooldownBypassAlreadyApproved = 145,
+/// Insufficient admin approvals for cooldown bypass (need 2/3).
+CooldownBypassInsufficientApprovals = 146,
+/// Cross-collateral pool not found.
+CollateralPoolNotFound = 132,
+/// Cross-collateral pool is already active (has an assigned borrower).
+CollateralPoolActive = 133,
+/// Caller is not a member of the specified collateral pool.
+NotPoolMember = 134,
+/// Gradual-unstake schedule not found for this voucher/borrower pair.
+GradualUnstakeNotFound = 135,
+/// A gradual-unstake schedule is already active for this pair.
+GradualUnstakeAlreadyActive = 136,
+/// The next instalment is not yet due.
+GradualUnstakeNotDue = 137,
+/// Loan extension request already pending for this borrower.
+ExtensionAlreadyRequested = 138,
+/// Maximum number of extensions per loan has been reached.
+MaxExtensionsReached = 139,
+/// Caller does not have permission to view this loan (privacy restriction).
+LoanPrivacyRestricted = 140,
+/// Insurance pool is not connected to this loan.
+InsuranceNotLinked = 141,
+/// No relay verification key is configured for the source chain.
+RelayKeyNotConfigured = 142,
+/// Relay chain id is zero or otherwise invalid.
+InvalidRelayChain = 143,
+/// A relay attestation reused an already-consumed nonce.
+RelayReplayDetected = 144,
+/// The relay attestation is older than the freshness window allows.
+RelayEventExpired = 145,
+/// The relay attestation is timestamped too far in the future.
+RelayEventFromFuture = 146,
+/// A relay event with this (source chain, sequence) was already processed.
+RelayEventAlreadyProcessed = 147,
+/// A relay acknowledgement tried to move the cursor backwards.
+RelayAckRegression = 148,
 }
