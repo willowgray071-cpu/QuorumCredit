@@ -1,4 +1,4 @@
-.PHONY: build test generate-sdk check-sdk deploy-testnet deploy-mainnet
+.PHONY: build test generate-sdk check-sdk deploy-testnet deploy-mainnet indexer indexer-test
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -10,7 +10,7 @@ WASM_FILE    := $(CONTRACT_DIR)/target/$(WASM_TARGET)/release/quorum_credit.wasm
 
 ## Compile the contract (native + WASM release build)
 build:
-	cd $(CONTRACT_DIR) && cargo build --target $(WASM_TARGET) --release
+	cd $(CONTRACT_DIR) && cargo build -p quorum_credit --target $(WASM_TARGET) --release
 
 ## Generate contract-parity SDK clients from the compiled WASM spec
 generate-sdk: build
@@ -50,3 +50,11 @@ deploy-mainnet:
 		--wasm $(WASM_FILE) \
 		--network mainnet \
 		--source $(DEPLOYER_SECRET_KEY)
+
+## Build the event indexer binary
+indexer:
+	cargo build -p quorum-credit-indexer --release
+
+## Run the event indexer tests
+indexer-test:
+	cargo test -p quorum-credit-indexer

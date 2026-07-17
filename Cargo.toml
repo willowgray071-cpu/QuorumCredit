@@ -1,4 +1,5 @@
 [workspace]
+members = ["tools/indexer"]
 resolver = "2"
 
 [package]
