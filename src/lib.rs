@@ -50,7 +50,10 @@ use crate::helpers::{
     loan_status as helper_loan_status, require_allowed_token, require_not_paused,
 };
 use crate::types::{AdminOperationType, Config, DataKey, DEFAULT_LOAN_DURATION, DEFAULT_MAX_LOAN_TO_STAKE_RATIO, DEFAULT_MAX_VOUCHERS, DEFAULT_MIN_LOAN_AMOUNT, DEFAULT_SLASH_BPS, DEFAULT_YIELD_BPS, DEFAULT_MIN_VOUCH_AGE_SECS};
-use soroban_sdk::{panic_with_error, symbol_short, token, Address, BytesN, Env, String, Vec};
+use soroban_sdk::{
+    contract, contractimpl, panic_with_error, symbol_short, token, Address, BytesN, Env, String,
+    Vec,
+};
 
 #[contract]
 pub struct QuorumCreditContract;

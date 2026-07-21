@@ -429,7 +429,6 @@ pub enum DataKey {
     Loan(u64),                   // loan_id → LoanRecord
     ActiveLoan(Address),         // borrower → active loan_id
     LatestLoan(Address),         // borrower → latest loan_id
-    RefinanceRecord(u64),       // loan_id → RefinanceRecord
     Vouches(Address),            // borrower → Vec<VouchRecord>
     VoucherHistory(Address),     // voucher → Vec<Address> (borrowers backed)
     Config,                      // Config struct: all configurable protocol parameters
@@ -448,7 +447,6 @@ pub enum DataKey {
     LoanPoolCounter, // u64: monotonically increasing pool ID counter
     PendingAdmin,    // Address of the pending admin (two-step transfer)
     RepaymentCount(Address), // borrower → u32 total successful repayments
-    RepaymentConfirmation(u64), // loan_id → bool confirmation flag
     LoanCount(Address), // borrower → u32 total historical loans disbursed
     DefaultCount(Address), // borrower → u32 total defaults (slash + auto_slash + claim_expired)
     ProtocolFeeBps,  // u32: protocol fee in basis points
