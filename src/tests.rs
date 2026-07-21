@@ -74,3 +74,5 @@ mod mainnet_deployment_test;
 mod api_reference_test;
 #[path = "monitoring_setup_test.rs"]
 mod monitoring_setup_test;
+#[path = "slash_appeal_test.rs"]
+mod slash_appeal_test;
